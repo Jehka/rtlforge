@@ -1,0 +1,6 @@
+{
+  "top": "counter_en",
+  "testbench": "tb.v",
+  "category": "sequential",
+  "difficulty": "easy"
+}

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.env
+work/
+results/
+sim.out
+obj_dir/

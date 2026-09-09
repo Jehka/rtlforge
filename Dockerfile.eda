@@ -1,0 +1,25 @@
+# EDA sandbox. No network at runtime, no API keys, no model access.
+# Built from Debian packages rather than a third-party EDA image so the tool
+# versions are pinned by the base image and nothing is pulled at run time.
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        verilator \
+        iverilog \
+        yosys \
+        make \
+        python3 \
+        python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+# cocotb goes here when you reach that stage; the pip install is the only
+# reason this image needs network access at build time.
+RUN pip3 install --no-cache-dir --break-system-packages cocotb==1.9.2
+
+# Runs as a non-root user: the agent writes into /work via a bind mount and
+# generated RTL should never be able to touch anything else.
+RUN useradd -m -u 1000 eda
+USER eda
+WORKDIR /work
+
+CMD ["sleep", "infinity"]

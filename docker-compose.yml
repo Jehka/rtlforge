@@ -1,0 +1,31 @@
+# Two containers, one shared volume, one boundary.
+#
+#   agent  -- has the API key and network egress, has no EDA tools
+#   eda    -- has the EDA tools, has NO network and NO key
+#
+# Generated RTL is untrusted input. It is executed only inside `eda`, which
+# cannot reach the internet even if a model emits something hostile.
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.agent
+    env_file: .env
+    volumes:
+      - ./work:/work
+      - ./results:/app/results
+      - ./problems:/app/problems:ro
+      # Lets the agent invoke the eda container. Comment this out and run the
+      # two containers by hand if your site forbids socket mounting.
+      - /var/run/docker.sock:/var/run/docker.sock
+    working_dir: /app
+
+  eda:
+    build:
+      context: .
+      dockerfile: Dockerfile.eda
+    network_mode: none          # <- the important line
+    volumes:
+      - ./work:/work
+    working_dir: /work
