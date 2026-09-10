@@ -19,6 +19,7 @@ from .parsers import (
     parse_icarus,
     parse_simulation,
     parse_verilator,
+    parse_verilogeval_sim,
     parse_yosys,
 )
 
@@ -122,12 +123,19 @@ def lint(design: Path, workdir: Path, strict: bool = False) -> StageResult:
 
 
 def compile_rtl(design: Path, workdir: Path,
-                tb: Optional[Path] = None) -> StageResult:
-    """Icarus compile. Catches things Verilator's lint pass lets through."""
+                tb: Optional[Path] = None,
+                extra: Optional[List[Path]] = None) -> StageResult:
+    """Icarus compile. Catches things Verilator's lint pass lets through.
+
+    `extra` carries additional sources the testbench needs -- VerilogEval
+    testbenches instantiate a golden RefModule alongside the candidate.
+    """
     if (miss := _missing("iverilog", "compile")):
         return miss
 
-    sources = [design.name] + ([tb.name] if tb else [])
+    sources = [design.name]
+    sources += [e.name for e in (extra or [])]
+    sources += [tb.name] if tb else []
     rc, out = _run(
         ["iverilog", "-g2012", "-o", "sim.out"] + sources, workdir
     )
@@ -137,8 +145,13 @@ def compile_rtl(design: Path, workdir: Path,
     return StageResult("compile", passed, diags if not passed else [], out)
 
 
-def simulate(workdir: Path, timeout: int = DEFAULT_TIMEOUT) -> StageResult:
-    """Run the compiled simulation. Requires compile_rtl to have run with a tb."""
+def simulate(workdir: Path, timeout: int = DEFAULT_TIMEOUT,
+             sim_format: str = "markers") -> StageResult:
+    """Run the compiled simulation. Requires compile_rtl to have run with a tb.
+
+    sim_format "markers"     -> our TB_PASS / MISMATCH protocol
+    sim_format "verilogeval" -> "Mismatches: N in M samples"
+    """
     if (miss := _missing("vvp", "simulate")):
         return miss
     if not (workdir / "sim.out").exists():
@@ -148,7 +161,9 @@ def simulate(workdir: Path, timeout: int = DEFAULT_TIMEOUT) -> StageResult:
         )
 
     rc, out = _run(["vvp", "sim.out"], workdir, timeout=timeout)
-    passed, diags = parse_simulation(out)
+    parse = (parse_verilogeval_sim if sim_format == "verilogeval"
+             else parse_simulation)
+    passed, diags = parse(out)
     return StageResult("simulate", passed, [] if passed else diags, out)
 
 

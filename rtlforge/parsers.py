@@ -163,6 +163,55 @@ def parse_simulation(output: str) -> tuple[bool, List[Diagnostic]]:
     return (saw_pass and not saw_fail), diags
 
 
+# -------------------------------------------------------- verilogeval sim
+
+# VerilogEval testbenches compare a generated TopModule against a RefModule
+# and end with "Mismatches: N in M samples". The "Hint:" lines name which
+# output diverged and when, which is far better repair feedback than a bare
+# count, so they are captured too.
+_VE_RESULT_RE = re.compile(
+    r"^Mismatches:\s+(?P<n>\d+)\s+in\s+(?P<total>\d+)\s+samples"
+)
+_VE_HINT_RE = re.compile(r"^Hint:\s*(?P<msg>.+)$")
+
+
+def parse_verilogeval_sim(output: str) -> tuple[bool, List[Diagnostic]]:
+    """Return (passed, diagnostics) for a VerilogEval-style testbench."""
+    diags: List[Diagnostic] = []
+    mismatches = None
+    total = None
+
+    for raw in output.splitlines():
+        line = raw.strip()
+        m = _VE_RESULT_RE.match(line)
+        if m:
+            mismatches = int(m.group("n"))
+            total = int(m.group("total"))
+            continue
+        m = _VE_HINT_RE.match(line)
+        if m:
+            msg = m.group("msg").strip()
+            # "no mismatches" hints are noise in a failure report
+            if "no mismatches" in msg.lower():
+                continue
+            diags.append(Diagnostic("error", None, "HINT", msg))
+
+    if mismatches is None:
+        return False, [
+            Diagnostic("error", None, "NO_VERDICT",
+                       "Simulation produced no 'Mismatches:' line.")
+        ]
+
+    if mismatches == 0:
+        return True, []
+
+    diags.insert(0, Diagnostic(
+        "error", None, "MISMATCH",
+        f"{mismatches} of {total} samples did not match the reference.",
+    ))
+    return False, diags[:MAX_MISMATCHES + 1]
+
+
 # ------------------------------------------------------------------- yosys
 
 _CELLS_RE = re.compile(r"Number of cells:\s+(?P<n>\d+)")
@@ -198,6 +247,24 @@ def parse_yosys(output: str) -> tuple[SynthMetrics, List[Diagnostic]]:
 
 
 # ------------------------------------------------------------------ helpers
+
+_SCORE_RE = re.compile(r"(?P<bad>\d+) of (?P<total>\d+) samples did not match")
+
+
+def failure_magnitude(diags: List[Diagnostic]) -> Optional[float]:
+    """Fraction of samples that mismatched, when the tool reported one.
+
+    Used to tell an improving repair from a regressing one. Returns None when
+    the failure is not a simulation mismatch (lint/compile errors have no
+    natural magnitude).
+    """
+    for d in diags:
+        m = _SCORE_RE.search(d.message)
+        if m:
+            total = int(m.group("total"))
+            return int(m.group("bad")) / total if total else 1.0
+    return None
+
 
 def render_feedback(diags: List[Diagnostic], limit: int = 12) -> str:
     """Compact, deduplicated feedback block for the repair prompt."""

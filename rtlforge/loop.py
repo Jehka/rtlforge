@@ -13,6 +13,7 @@ Design notes that matter for the experiment:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import time
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import runners
-from .parsers import render_feedback
+from .parsers import failure_magnitude, render_feedback
 from .providers import LLMClient, extract_verilog
 
 DESIGN_FILENAME = "design.v"
@@ -41,6 +42,10 @@ class Attempt:
     rtl: str
     stages: List[dict] = field(default_factory=list)
     passed: bool = False
+    rtl_hash: str = ""          # identical hashes across attempts = a stall
+    failed_stage: Optional[str] = None
+    magnitude: Optional[float] = None   # fraction of samples mismatching
+    rolled_back: bool = False   # this attempt was repaired from an earlier one
 
 
 @dataclass
@@ -55,6 +60,7 @@ class RunResult:
     wall_clock_s: float = 0.0
     terminal_stage: Optional[str] = None   # failed where this level is blind
     truncated: bool = False                # a response hit the token ceiling
+    stop_reason: str = ""                  # why the loop ended
     prompt_tokens: int = 0
     completion_tokens: int = 0
     final_cells: Optional[int] = None
@@ -73,8 +79,11 @@ class RunResult:
             "final_cells": self.final_cells,
             "terminal_stage": self.terminal_stage,
             "truncated": self.truncated,
+            "stop_reason": self.stop_reason,
             "attempts": [
-                {"index": a.index, "passed": a.passed, "stages": a.stages}
+                {"index": a.index, "passed": a.passed, "stages": a.stages,
+                 "rtl_hash": a.rtl_hash, "failed_stage": a.failed_stage,
+                 "magnitude": a.magnitude, "rolled_back": a.rolled_back}
                 for a in self.attempts
             ],
         }
@@ -108,6 +117,14 @@ class Problem:
         self.tb_path = self.dir / meta.get("testbench", "tb.v")
         if not self.tb_path.exists():
             raise FileNotFoundError(f"missing trusted testbench: {self.tb_path}")
+        # Extra sources the testbench needs (e.g. a golden RefModule).
+        self.extra_sources = [
+            self.dir / n for n in meta.get("extra_sources", [])
+        ]
+        for e in self.extra_sources:
+            if not e.exists():
+                raise FileNotFoundError(f"missing source: {e}")
+        self.sim_format = meta.get("sim_format", "markers")
 
 
 def _generate_prompt(problem: Problem) -> List[dict]:
@@ -123,8 +140,53 @@ def _generate_prompt(problem: Problem) -> List[dict]:
     ]
 
 
+STAGE_RANK = {"generate": 0, "lint": 1, "compile": 2, "simulate": 3,
+              "synth": 4, None: 5}
+
+
+def _magnitude_from(stage: dict) -> Optional[float]:
+    from .parsers import Diagnostic as _D
+    diags = [_D(d["severity"], d["line"], d["code"], d["message"])
+             for d in stage.get("diagnostics", [])]
+    return failure_magnitude(diags)
+
+
+def _progress(attempt: Attempt) -> tuple:
+    """Rank an attempt so a regression can be detected.
+
+    Further through the pipeline is better; at the same stage, fewer
+    mismatching samples is better.
+    """
+    rank = STAGE_RANK.get(attempt.failed_stage, 0)
+    mag = attempt.magnitude if attempt.magnitude is not None else 1.0
+    return (rank, -mag)
+
+
+def _history_block(attempts: List[Attempt], limit: int = 3) -> str:
+    """Compact record of what has already been tried and how it went.
+
+    Without this the model re-proposes fixes it has already made, which is
+    exactly the oscillation seen on multi-output FSMs: mismatch counts that
+    go down, then up, then back to a previous value.
+    """
+    prior = [a for a in attempts if not a.passed][-limit:]
+    if len(prior) < 2:
+        return ""
+    lines = []
+    for a in prior:
+        mag = (f"{a.magnitude:.1%} of samples mismatched"
+               if a.magnitude is not None else "did not reach simulation")
+        lines.append(f"- attempt {a.index}: failed at {a.failed_stage}, {mag}")
+    return (
+        "\nAttempts so far:\n" + "\n".join(lines) +
+        "\n\nDo not repeat a fix that has already been tried. If the last "
+        "change made things worse, reconsider the approach rather than "
+        "adjusting it further.\n"
+    )
+
+
 def _repair_prompt(problem: Problem, rtl: str, stage: str,
-                   feedback: str) -> List[dict]:
+                   feedback: str, history: str = "") -> List[dict]:
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -133,7 +195,8 @@ def _repair_prompt(problem: Problem, rtl: str, stage: str,
                 f"Specification for module `{problem.top}`:\n\n{problem.spec}\n\n"
                 f"This implementation failed at the {stage} stage:\n\n"
                 f"```verilog\n{rtl}\n```\n\n"
-                f"Tool diagnostics:\n{feedback}\n\n"
+                f"Tool diagnostics:\n{feedback}\n"
+                f"{history}\n"
                 "Fix the underlying cause and return the complete corrected "
                 "module. Do not suppress warnings with pragmas and do not "
                 "change the module name or port list unless the "
@@ -178,6 +241,11 @@ def run_problem(
     # The trusted testbench is copied in fresh each run and never regenerated.
     tb_local = workdir / problem.tb_path.name
     shutil.copy(problem.tb_path, tb_local)
+    extra_local = []
+    for e in problem.extra_sources:
+        dst = workdir / e.name
+        shutil.copy(e, dst)
+        extra_local.append(dst)
 
     design = workdir / DESIGN_FILENAME
     result = RunResult(
@@ -192,6 +260,9 @@ def run_problem(
     start = time.time()
     messages = _generate_prompt(problem)
     rtl = _generate(client, messages, result)
+    seen_hashes: set = set()
+    best: Optional[Attempt] = None
+    best_rtl = rtl
 
     # "none" is single-shot: generate, score once, never repair.
     iterations = 1 if feedback_level == "none" else max_iterations
@@ -199,7 +270,25 @@ def run_problem(
     for i in range(1, iterations + 1):
         result.iterations = i
         design.write_text(rtl)
-        attempt = Attempt(index=i, rtl=rtl)
+        rtl_hash = hashlib.sha256(rtl.encode()).hexdigest()[:12]
+        attempt = Attempt(index=i, rtl=rtl, rtl_hash=rtl_hash)
+
+        # An identical regeneration means the model has stopped responding to
+        # feedback. Further iterations cost tokens and change nothing.
+        if rtl_hash in seen_hashes:
+            attempt.failed_stage = "generate"
+            attempt.stages.append({
+                "stage": "generate", "passed": False, "skipped": False,
+                "note": "identical to an earlier attempt; loop stalled",
+                "diagnostics": [{"severity": "error", "line": None,
+                                 "code": "STALLED",
+                                 "message": "regenerated identical RTL"}],
+                "metrics": None,
+            })
+            result.attempts.append(attempt)
+            result.stop_reason = "stalled"
+            break
+        seen_hashes.add(rtl_hash)
 
         # Cheap structural check before invoking any tool. Catches truncated
         # or empty generations with an unambiguous message.
@@ -230,9 +319,11 @@ def run_problem(
             if stage == "lint":
                 sr = runners.lint(design, workdir, strict=strict_lint)
             elif stage == "compile":
-                sr = runners.compile_rtl(design, workdir, tb=tb_local)
+                sr = runners.compile_rtl(design, workdir, tb=tb_local,
+                                         extra=extra_local)
             elif stage == "simulate":
-                sr = runners.simulate(workdir)
+                sr = runners.simulate(workdir,
+                                      sim_format=problem.sim_format)
             elif stage == "synth":
                 sr = runners.synthesize(design, workdir, problem.top)
             else:
@@ -250,12 +341,20 @@ def run_problem(
                 result.final_cells = sr.metrics.cells
 
         attempt.passed = failed_stage is None
+        attempt.failed_stage = failed_stage
+        if failed_stage and attempt.stages:
+            attempt.magnitude = _magnitude_from(attempt.stages[-1])
         result.attempts.append(attempt)
 
         if attempt.passed:
             result.passed = True
+            result.stop_reason = "passed"
             break
-        if feedback_level == "none" or i == iterations:
+        if feedback_level == "none":
+            result.stop_reason = "single-shot"
+            break
+        if i == iterations:
+            result.stop_reason = "iteration budget"
             break
 
         # A failure at a stage outside this level's repair set is terminal:
@@ -264,11 +363,28 @@ def run_problem(
         # functional bug, and must be scored as failing when it hits one.
         if failed_stage not in repair_stages:
             result.terminal_stage = failed_stage
+            result.stop_reason = "no feedback signal for this stage"
             break
 
+        # Roll back to the best attempt so far if this one regressed. Without
+        # this the loop can repair a worse design into an even worse one --
+        # observed as attempts that introduce new lint errors after previously
+        # passing lint.
+        if best is None or _progress(attempt) >= _progress(best):
+            best, best_rtl = attempt, rtl
+            repair_from, rolled = rtl, False
+        else:
+            repair_from, rolled = best_rtl, True
+
         rtl = _generate(
-            client, _repair_prompt(problem, rtl, failed_stage, feedback), result
+            client,
+            _repair_prompt(problem, repair_from, failed_stage, feedback,
+                           _history_block(result.attempts)),
+            result,
         )
+        if rolled:
+            # Mark the attempt this repair was based on, not the one it replaced.
+            attempt.rolled_back = True
 
     result.wall_clock_s = time.time() - start
     result.prompt_tokens = client.usage.prompt_tokens

@@ -120,10 +120,80 @@ problems/<name>/
   tb.v           trusted oracle, never shown to the model
 ```
 
-Before scaling up: pull VerilogEval v2 or RTLLM rather than hand-writing 30
-oracles. You get immutable testbenches for free and your numbers become
+### VerilogEval
+
+```bash
+git clone --depth 1 https://github.com/NVlabs/verilog-eval.git ../verilog-eval
+python -m rtlforge.cli import-verilogeval \
+    --dataset ../verilog-eval/dataset_spec-to-rtl
+python -m rtlforge.cli selftest --problems problems/verilogeval --write-manifest
+```
+
+156 problems import. `selftest` runs each problem's own reference design
+through the pipeline; 155 pass under Icarus 12. Exclude what it reports --
+a reference that fails its own testbench is a toolchain gap, and scoring a
+model on it records a failure that has nothing to do with the model.
+
+These testbenches compare against a golden RefModule, so they need none of the
+hand-validation our own oracles required.
+
+Before scaling up further: prefer these over hand-writing oracles. You get immutable testbenches for free and your numbers become
 comparable to published work. Check which problems you trust first — published
 work has found flawed cases in the existing RTL benchmarks.
+
+## Running a benchmark
+
+```bash
+# one session's worth; stops cleanly when the quota runs out
+python -m rtlforge.cli benchmark --problems problems/verilogeval \
+    --levels none full --shuffle --limit 30 \
+    --model openai/gpt-oss-120b --reasoning-effort low --max-tokens 3072
+
+# next session: same command plus --out <that dir> --resume
+```
+
+Free-tier daily caps mean a full 155-problem benchmark spans several sessions.
+Every completed run is written to disk immediately and `--resume` skips work
+already done, so a 429 on the last problem costs nothing. Rate-limit failures
+stop the run rather than being recorded as model failures -- a 429 says nothing
+about the RTL.
+
+`--shuffle` samples across the set. Without it a partial run only ever covers
+alphabetically early problems, which are not a representative sample.
+
+The summary reports pass rate per level and, more usefully, which problems
+were **rescued** (failed single-shot, passed with the loop) and which
+**regressed**. That contrast is the experiment; the aggregate percentage is
+just its headline.
+
+## Convergence controls
+
+The first valid benchmark run showed the loop oscillating on multi-output
+FSMs -- mismatch counts going 522 -> 398 -> 672 -> 504 -> 592, and on another
+problem two byte-identical final attempts. Four controls address that:
+
+- **Stall detection.** An attempt whose RTL hashes identically to an earlier
+  one ends the run with `stop_reason: stalled`. The model has stopped
+  responding to feedback; further iterations cost tokens and change nothing.
+- **Repair history.** Each repair prompt now lists prior attempts and their
+  failure magnitudes. Without it the model re-proposes fixes it already made.
+- **Rollback.** If an attempt regresses -- fails at an earlier stage, or
+  mismatches more samples -- the next repair starts from the best attempt so
+  far rather than the worst.
+- **`rtl_hash` on every attempt**, so oscillation between repeated states is
+  greppable rather than something you notice by eye.
+
+`stop_reason` is reported per run: `passed`, `stalled`, `iteration budget`,
+`no feedback signal for this stage`, `single-shot`.
+
+### Reading the summary honestly
+
+A problem that fails at `none` and passes at `full` on **attempt 1** saw no
+feedback at all -- same prompt, different sample. That is temperature noise,
+not repair. The benchmark summary separates these: `repaired by` counts only
+runs with `iterations > 1`, and apparent rescues that passed first try are
+reported separately as noise. In the first 30-problem run this was the
+difference between a claimed +7 and a real +5.
 
 ## Design notes
 

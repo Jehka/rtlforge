@@ -1,0 +1,10 @@
+{
+  "top": "TopModule",
+  "testbench": "tb.sv",
+  "extra_sources": [
+    "ref.sv"
+  ],
+  "sim_format": "verilogeval",
+  "source": "VerilogEval spec-to-rtl",
+  "problem_id": "Prob010_mt2015_q4a"
+}
