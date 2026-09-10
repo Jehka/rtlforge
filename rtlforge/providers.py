@@ -61,6 +61,7 @@ class LLMClient:
         temperature: float = 0.2,
         max_retries: int = 4,
         max_tokens: int = 8192,
+        reasoning_effort: Optional[str] = None,
     ):
         if provider not in PROVIDERS:
             raise LLMError(
@@ -79,6 +80,11 @@ class LLMClient:
         # against tokens-per-minute at request time, so oversizing it can
         # cause 429s on an otherwise idle account. 8192 is the compromise.
         self.max_tokens = max_tokens
+        # gpt-oss models spend most of their budget reasoning before emitting
+        # any code -- 2500-4100 tokens for a ~600-token Verilog module. On a
+        # capped free tier that is the difference between 50 generations a day
+        # and 150. "low" is plenty for a single RTL module.
+        self.reasoning_effort = reasoning_effort
         self.usage = Usage()
         # Set after every call. "length" means the response was cut off, which
         # produces a truncated module that looks like a syntax error. That
@@ -105,6 +111,10 @@ class LLMClient:
             "temperature": self.temperature,
             "max_tokens": max_tokens,
         }
+        if self.reasoning_effort:
+            # Only gpt-oss-family models accept this; harmless elsewhere but
+            # some providers 400 on unknown fields, hence opt-in.
+            payload["reasoning_effort"] = self.reasoning_effort
 
         delay = 2.0
         last_err = ""

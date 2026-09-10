@@ -65,7 +65,8 @@ def cmd_run(args) -> int:
     problem = Problem(Path(args.problem))
     try:
         client = LLMClient(provider=args.provider, model=args.model,
-                           max_tokens=args.max_tokens)
+                           max_tokens=args.max_tokens,
+                           reasoning_effort=args.reasoning_effort)
     except LLMError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -104,7 +105,8 @@ def cmd_sweep(args) -> int:
         for trial in range(1, args.trials + 1):
             try:
                 client = LLMClient(provider=args.provider, model=args.model,
-                                   max_tokens=args.max_tokens)
+                                   max_tokens=args.max_tokens,
+                                   reasoning_effort=args.reasoning_effort)
                 r = run_problem(
                     problem,
                     client,
@@ -158,6 +160,65 @@ def _summarise(rows, levels) -> None:
             f"mean iters {mean_iters:.1f}{warn}"
         )
 
+def cmd_report(args) -> int:
+    """Merge raw.json files from several sweeps and summarise together.
+
+    Free-tier daily caps force data collection across multiple sessions.
+    Without this, each day's partial sweep looks like its own underpowered
+    experiment instead of part of one dataset.
+    """
+    rows = []
+    for path in args.inputs:
+        p = Path(path)
+        files = sorted(p.rglob("raw.json")) if p.is_dir() else [p]
+        for f in files:
+            try:
+                rows.extend(json.loads(f.read_text()))
+            except (OSError, json.JSONDecodeError) as e:
+                print(f"skipping {f}: {e}", file=sys.stderr)
+
+    if not rows:
+        print("no runs found", file=sys.stderr)
+        return 1
+
+    # Truncated runs measured output length, not RTL quality. Excluding them
+    # is the honest default; --include-truncated overrides for inspection.
+    total = len(rows)
+    if not args.include_truncated:
+        rows = [r for r in rows if not r.get("truncated")]
+        dropped = total - len(rows)
+        if dropped:
+            print(f"excluded {dropped} truncated run(s) of {total}")
+
+    models = sorted({r.get("model", "?") for r in rows})
+    problems = sorted({r.get("problem", "?") for r in rows})
+    print(f"models: {', '.join(models)}")
+    print(f"problems: {', '.join(problems)}")
+
+    levels = sorted({r["feedback_level"] for r in rows},
+                    key=lambda l: list(STAGES_BY_LEVEL).index(l)
+                    if l in STAGES_BY_LEVEL else 99)
+    _summarise(rows, levels)
+
+    # Where runs die is the interesting part; aggregate pass rates hide it.
+    print("\n=== first failing stage ===")
+    for level in levels:
+        sub = [r for r in rows if r["feedback_level"] == level and not r["passed"]]
+        if not sub:
+            continue
+        tally = {}
+        for r in sub:
+            last = r["attempts"][-1] if r["attempts"] else None
+            stage = "?"
+            if last:
+                failed = [s["stage"] for s in last["stages"] if not s["passed"]]
+                stage = failed[0] if failed else "?"
+            tally[stage] = tally.get(stage, 0) + 1
+        detail = ", ".join(f"{k}={v}" for k, v in sorted(tally.items()))
+        print(f"{level:8}  {detail}")
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="rtlforge")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -172,6 +233,9 @@ def main(argv=None) -> int:
         sp.add_argument("--max-iterations", type=int, default=5)
         sp.add_argument("--strict-lint", action="store_true",
                         help="treat lint warnings as failures")
+        sp.add_argument("--reasoning-effort", default=None,
+                        choices=["low", "medium", "high"],
+                        help="gpt-oss models only; 'low' cuts token use ~3x")
         sp.add_argument("--max-tokens", type=int, default=8192,
                         help="per-response ceiling; also reserved against "
                              "tokens-per-minute, so lower it if you see 429s")
@@ -193,6 +257,13 @@ def main(argv=None) -> int:
                     default=["none", "lint", "compile", "sim", "full"])
     sp.add_argument("--trials", type=int, default=3)
     sp.set_defaults(func=cmd_sweep)
+
+    sp = sub.add_parser("report", help="merge and summarise sweep results")
+    sp.add_argument("inputs", nargs="+",
+                    help="raw.json files or directories to search")
+    sp.add_argument("--include-truncated", action="store_true",
+                    help="keep runs that hit the token ceiling")
+    sp.set_defaults(func=cmd_report)
 
     args = p.parse_args(argv)
     return args.func(args)
