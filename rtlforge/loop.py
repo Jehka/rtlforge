@@ -54,6 +54,7 @@ class RunResult:
     attempts: List[Attempt] = field(default_factory=list)
     wall_clock_s: float = 0.0
     terminal_stage: Optional[str] = None   # failed where this level is blind
+    truncated: bool = False                # a response hit the token ceiling
     prompt_tokens: int = 0
     completion_tokens: int = 0
     final_cells: Optional[int] = None
@@ -71,6 +72,7 @@ class RunResult:
             "completion_tokens": self.completion_tokens,
             "final_cells": self.final_cells,
             "terminal_stage": self.terminal_stage,
+            "truncated": self.truncated,
             "attempts": [
                 {"index": a.index, "passed": a.passed, "stages": a.stages}
                 for a in self.attempts
@@ -141,6 +143,20 @@ def _repair_prompt(problem: Problem, rtl: str, stage: str,
     ]
 
 
+def _generate(client, messages, result) -> str:
+    """One model call, with truncation surfaced immediately.
+
+    A cut-off response yields half a module, which lint reports as
+    "unexpected end of file" and Icarus reports as "Unknown module type".
+    Both look like model errors and are not. Catching it here keeps the
+    experiment measuring RTL quality rather than token budget.
+    """
+    text = client.chat(messages)
+    if client.last_finish_reason == "length":
+        result.truncated = True
+    return extract_verilog(text)
+
+
 def run_problem(
     problem: Problem,
     client: LLMClient,
@@ -175,7 +191,7 @@ def run_problem(
 
     start = time.time()
     messages = _generate_prompt(problem)
-    rtl = extract_verilog(client.chat(messages))
+    rtl = _generate(client, messages, result)
 
     # "none" is single-shot: generate, score once, never repair.
     iterations = 1 if feedback_level == "none" else max_iterations
@@ -184,6 +200,27 @@ def run_problem(
         result.iterations = i
         design.write_text(rtl)
         attempt = Attempt(index=i, rtl=rtl)
+
+        # Cheap structural check before invoking any tool. Catches truncated
+        # or empty generations with an unambiguous message.
+        if f"module {problem.top}" not in rtl or "endmodule" not in rtl:
+            note = ("response truncated at the token limit"
+                    if client.last_finish_reason == "length"
+                    else f"generated text does not define module "
+                         f"`{problem.top}` with a matching endmodule")
+            attempt.stages.append({
+                "stage": "generate", "passed": False, "skipped": False,
+                "note": note,
+                "diagnostics": [{"severity": "error", "line": None,
+                                 "code": "TRUNCATED", "message": note}],
+                "metrics": None,
+            })
+            attempt.passed = False
+            result.attempts.append(attempt)
+            if feedback_level == "none" or i == iterations:
+                break
+            rtl = _generate(client, _generate_prompt(problem), result)
+            continue
 
         failed_stage = None
         feedback = ""
@@ -229,8 +266,8 @@ def run_problem(
             result.terminal_stage = failed_stage
             break
 
-        rtl = extract_verilog(
-            client.chat(_repair_prompt(problem, rtl, failed_stage, feedback))
+        rtl = _generate(
+            client, _repair_prompt(problem, rtl, failed_stage, feedback), result
         )
 
     result.wall_clock_s = time.time() - start

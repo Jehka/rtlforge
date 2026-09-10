@@ -74,6 +74,11 @@ class LLMClient:
         self.temperature = temperature
         self.max_retries = max_retries
         self.usage = Usage()
+        # Set after every call. "length" means the response was cut off, which
+        # produces a truncated module that looks like a syntax error. That
+        # misattribution is deadly to the experiment, so it is surfaced
+        # explicitly rather than left to the linter to misdiagnose.
+        self.last_finish_reason: Optional[str] = None
 
         self.api_key = os.environ.get(key_env) if key_env else None
         if key_env and not self.api_key:
@@ -81,7 +86,7 @@ class LLMClient:
                 f"{key_env} is not set. Copy .env.example to .env and fill it in."
             )
 
-    def chat(self, messages: List[dict], max_tokens: int = 2048) -> str:
+    def chat(self, messages: List[dict], max_tokens: int = 16384) -> str:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -127,11 +132,13 @@ class LLMClient:
                 raise LLMError(f"{r.status_code}: {r.text[:400]}")
 
             data = r.json()
+            choice = data["choices"][0]
+            self.last_finish_reason = choice.get("finish_reason")
             u = data.get("usage") or {}
             self.usage = self.usage + Usage(
                 u.get("prompt_tokens", 0), u.get("completion_tokens", 0)
             )
-            return data["choices"][0]["message"]["content"] or ""
+            return choice["message"].get("content") or ""
 
         raise LLMError(f"failed after {self.max_retries} attempts: {last_err}")
 

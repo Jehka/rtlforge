@@ -129,9 +129,17 @@ def cmd_sweep(args) -> int:
             continue
         passes = sum(r["passed"] for r in sub)
         mean_iters = sum(r["iterations"] for r in sub) / len(sub)
+        trunc = sum(r.get("truncated", False) for r in sub)
+        warn = f"  [TRUNCATED in {trunc}]" if trunc else ""
         print(
             f"{level:8}  pass {passes}/{len(sub)}  "
-            f"mean iters {mean_iters:.1f}"
+            f"mean iters {mean_iters:.1f}{warn}"
+        )
+    if any(r.get("truncated") for r in rows):
+        print(
+            "\nWARNING: some responses hit the token ceiling. Those runs "
+            "measure output length, not RTL quality -- raise max_tokens and "
+            "re-run before drawing conclusions."
         )
     print(f"\nlog: {out}")
     return 0
