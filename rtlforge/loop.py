@@ -53,6 +53,7 @@ class RunResult:
     iterations: int
     attempts: List[Attempt] = field(default_factory=list)
     wall_clock_s: float = 0.0
+    terminal_stage: Optional[str] = None   # failed where this level is blind
     prompt_tokens: int = 0
     completion_tokens: int = 0
     final_cells: Optional[int] = None
@@ -69,6 +70,7 @@ class RunResult:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "final_cells": self.final_cells,
+            "terminal_stage": self.terminal_stage,
             "attempts": [
                 {"index": a.index, "passed": a.passed, "stages": a.stages}
                 for a in self.attempts
@@ -76,8 +78,10 @@ class RunResult:
         }
 
 
-# Feedback levels are the experiment's independent variable. "none" is the
-# single-shot baseline; each level adds one deterministic signal.
+# Feedback levels are the experiment's independent variable. They control what
+# the model is TOLD, never what it is GRADED on. Every run is scored against
+# the full stage set; only the repair signal differs. Grading a lint-only run
+# on lint alone would compare a spelling quiz against a full exam.
 STAGES_BY_LEVEL = {
     "none": [],
     "lint": ["lint"],
@@ -85,6 +89,9 @@ STAGES_BY_LEVEL = {
     "sim": ["lint", "compile", "simulate"],
     "full": ["lint", "compile", "simulate", "synth"],
 }
+
+# Always run all four. This is the scoreboard.
+SCORING_STAGES = ["lint", "compile", "simulate", "synth"]
 
 
 class Problem:
@@ -148,7 +155,7 @@ def run_problem(
             f"choose from {sorted(STAGES_BY_LEVEL)}"
         )
 
-    stages = STAGES_BY_LEVEL[feedback_level]
+    repair_stages = STAGES_BY_LEVEL[feedback_level]
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
 
@@ -170,10 +177,8 @@ def run_problem(
     messages = _generate_prompt(problem)
     rtl = extract_verilog(client.chat(messages))
 
-    # "none" is single-shot: generate, evaluate once, no repair. It still runs
-    # the full stage set so the baseline is scored identically.
+    # "none" is single-shot: generate, score once, never repair.
     iterations = 1 if feedback_level == "none" else max_iterations
-    eval_stages = STAGES_BY_LEVEL["full"] if feedback_level == "none" else stages
 
     for i in range(1, iterations + 1):
         result.iterations = i
@@ -183,7 +188,8 @@ def run_problem(
         failed_stage = None
         feedback = ""
 
-        for stage in eval_stages:
+        # Score against every stage, always.
+        for stage in SCORING_STAGES:
             if stage == "lint":
                 sr = runners.lint(design, workdir, strict=strict_lint)
             elif stage == "compile":
@@ -213,6 +219,14 @@ def run_problem(
             result.passed = True
             break
         if feedback_level == "none" or i == iterations:
+            break
+
+        # A failure at a stage outside this level's repair set is terminal:
+        # the configuration under test has no signal to act on. This is the
+        # point of the ablation -- a lint-only agent genuinely cannot see a
+        # functional bug, and must be scored as failing when it hits one.
+        if failed_stage not in repair_stages:
+            result.terminal_stage = failed_stage
             break
 
         rtl = extract_verilog(
