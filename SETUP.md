@@ -274,7 +274,7 @@ the repair loop actually work, use a weaker model:
 
 ```bash
 python -m rtlforge.cli run --problem problems/counter --level full \
-    --model llama-3.1-8b-instant
+    --model openai/gpt-oss-20b
 ```
 
 Open the JSON in `results/`. Each attempt records its stages and diagnostics.

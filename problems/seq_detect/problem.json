@@ -1,0 +1,6 @@
+{
+  "top": "seq_detect_1011",
+  "testbench": "tb.v",
+  "category": "fsm",
+  "difficulty": "medium"
+}

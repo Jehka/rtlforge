@@ -1,0 +1,6 @@
+{
+  "top": "sync_fifo",
+  "testbench": "tb.v",
+  "category": "storage",
+  "difficulty": "medium"
+}

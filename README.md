@@ -10,9 +10,22 @@ configuration so the ablation is one command.
 
 ## Status
 
-Working: parsers, runners, repair loop, CLI, one validated problem, container
-definitions. Not yet built: cocotb regression, SymbiYosys, additional problems,
-result plotting.
+Working: parsers, runners, repair loop, CLI, three validated problems,
+oracle regression tests, container definitions. Not yet built: cocotb
+regression, SymbiYosys, VerilogEval integration, result plotting.
+
+## Problems
+
+| Problem | Top | Tests |
+|---|---|---|
+| `counter` | `counter_en` | async reset, enable hold, 4-bit wrap |
+| `seq_detect` | `seq_detect_1011` | overlapping detection, one-cycle pulse, reset mid-pattern, 400 random bits vs. reference |
+| `fifo` | `sync_fifo` | fill/drain ordering, overflow and underflow ignored, simultaneous r/w, pointer wrap, 600 random ops vs. reference |
+
+Each has a known-good design and two to three known-bad ones in `examples/`.
+`tests/test_oracles.py` asserts every testbench still passes the good design
+and still fails each bug at the expected stage. Run it after touching any
+testbench or upgrading a tool.
 
 ## Quick start
 
