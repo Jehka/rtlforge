@@ -64,7 +64,8 @@ def cmd_check(args) -> int:
 def cmd_run(args) -> int:
     problem = Problem(Path(args.problem))
     try:
-        client = LLMClient(provider=args.provider, model=args.model)
+        client = LLMClient(provider=args.provider, model=args.model,
+                           max_tokens=args.max_tokens)
     except LLMError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
@@ -102,18 +103,25 @@ def cmd_sweep(args) -> int:
     for level in args.levels:
         for trial in range(1, args.trials + 1):
             try:
-                client = LLMClient(provider=args.provider, model=args.model)
+                client = LLMClient(provider=args.provider, model=args.model,
+                                   max_tokens=args.max_tokens)
+                r = run_problem(
+                    problem,
+                    client,
+                    workdir=Path(args.workdir) / f"{problem.name}-{level}-{trial}",
+                    feedback_level=level,
+                    max_iterations=args.max_iterations,
+                    strict_lint=args.strict_lint,
+                )
             except LLMError as e:
-                print(f"error: {e}", file=sys.stderr)
-                return 2
-            r = run_problem(
-                problem,
-                client,
-                workdir=Path(args.workdir) / f"{problem.name}-{level}-{trial}",
-                feedback_level=level,
-                max_iterations=args.max_iterations,
-                strict_lint=args.strict_lint,
-            )
+                # A sweep that crashes on the last trial must not discard the
+                # ones that already succeeded.
+                print(f"\nAPI error, stopping sweep: {e}", file=sys.stderr)
+                (out / "raw.json").write_text(json.dumps(rows, indent=2))
+                print(f"{len(rows)} completed run(s) saved to {out}",
+                      file=sys.stderr)
+                _summarise(rows, args.levels)
+                return 3
             rows.append(r.as_dict())
             print(
                 f"  {level:8} trial {trial}: "
@@ -122,8 +130,22 @@ def cmd_sweep(args) -> int:
             )
             (out / "raw.json").write_text(json.dumps(rows, indent=2))
 
+    _summarise(rows, args.levels)
+    if any(r.get("truncated") for r in rows):
+        print(
+            "\nWARNING: some responses hit the token ceiling. Those runs "
+            "measure output length, not RTL quality -- raise --max-tokens and "
+            "re-run before drawing conclusions."
+        )
+    print(f"\nlog: {out}")
+    return 0
+
+
+def _summarise(rows, levels) -> None:
+    if not rows:
+        return
     print("\n=== summary ===")
-    for level in args.levels:
+    for level in levels:
         sub = [r for r in rows if r["feedback_level"] == level]
         if not sub:
             continue
@@ -135,15 +157,6 @@ def cmd_sweep(args) -> int:
             f"{level:8}  pass {passes}/{len(sub)}  "
             f"mean iters {mean_iters:.1f}{warn}"
         )
-    if any(r.get("truncated") for r in rows):
-        print(
-            "\nWARNING: some responses hit the token ceiling. Those runs "
-            "measure output length, not RTL quality -- raise max_tokens and "
-            "re-run before drawing conclusions."
-        )
-    print(f"\nlog: {out}")
-    return 0
-
 
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="rtlforge")
@@ -159,6 +172,9 @@ def main(argv=None) -> int:
         sp.add_argument("--max-iterations", type=int, default=5)
         sp.add_argument("--strict-lint", action="store_true",
                         help="treat lint warnings as failures")
+        sp.add_argument("--max-tokens", type=int, default=8192,
+                        help="per-response ceiling; also reserved against "
+                             "tokens-per-minute, so lower it if you see 429s")
 
     sp = sub.add_parser("check", help="run EDA stages on an existing file")
     sp.add_argument("--problem", required=True)

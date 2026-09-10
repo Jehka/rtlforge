@@ -60,6 +60,7 @@ class LLMClient:
         base_url: Optional[str] = None,
         temperature: float = 0.2,
         max_retries: int = 4,
+        max_tokens: int = 8192,
     ):
         if provider not in PROVIDERS:
             raise LLMError(
@@ -73,6 +74,11 @@ class LLMClient:
         self.model = model or default_model
         self.temperature = temperature
         self.max_retries = max_retries
+        # Reasoning models spend budget before emitting code, so this must be
+        # well above the size of the expected module. But it is also reserved
+        # against tokens-per-minute at request time, so oversizing it can
+        # cause 429s on an otherwise idle account. 8192 is the compromise.
+        self.max_tokens = max_tokens
         self.usage = Usage()
         # Set after every call. "length" means the response was cut off, which
         # produces a truncated module that looks like a syntax error. That
@@ -86,7 +92,9 @@ class LLMClient:
                 f"{key_env} is not set. Copy .env.example to .env and fill it in."
             )
 
-    def chat(self, messages: List[dict], max_tokens: int = 16384) -> str:
+    def chat(self, messages: List[dict],
+             max_tokens: Optional[int] = None) -> str:
+        max_tokens = max_tokens or self.max_tokens
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -115,11 +123,30 @@ class LLMClient:
                 continue
 
             if r.status_code == 429:
-                # Free tiers rate-limit aggressively; honour Retry-After when given.
+                # The body says WHICH limit was hit. Requests-per-day and
+                # tokens-per-minute need opposite responses -- one means stop
+                # for today, the other means wait a minute -- so never discard
+                # this text.
+                body = r.text[:300]
+                limits = {
+                    k: v for k, v in r.headers.items()
+                    if k.lower().startswith("x-ratelimit")
+                }
+                low = body.lower()
+
+                # A per-day exhaustion will not clear by retrying. Fail fast
+                # rather than burning four backoffs to reach the same place.
+                if "per day" in low or "rpd" in low or "tpd" in low:
+                    raise LLMError(
+                        "daily quota exhausted -- retrying will not help.\n"
+                        f"  {body}\n"
+                        f"  limits: {limits}"
+                    )
+
                 wait = float(r.headers.get("retry-after", delay))
-                time.sleep(min(wait, 60))
-                delay *= 2
-                last_err = "rate limited (429)"
+                time.sleep(min(wait, 120))
+                delay = min(delay * 2, 120)
+                last_err = f"rate limited (429): {body} | limits: {limits}"
                 continue
 
             if r.status_code >= 500:
@@ -140,7 +167,12 @@ class LLMClient:
             )
             return choice["message"].get("content") or ""
 
-        raise LLMError(f"failed after {self.max_retries} attempts: {last_err}")
+        raise LLMError(
+            f"failed after {self.max_retries} attempts: {last_err}\n"
+            "  If this mentions tokens-per-minute, lower --max-tokens: the "
+            "ceiling is reserved against your TPM allowance at request time, "
+            "so an oversized budget can 429 even on an idle account."
+        )
 
 
 # ------------------------------------------------------------------ helpers
