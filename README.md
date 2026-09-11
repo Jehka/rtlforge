@@ -129,10 +129,20 @@ python -m rtlforge.cli import-verilogeval \
 python -m rtlforge.cli selftest --problems problems/verilogeval --write-manifest
 ```
 
-156 problems import. `selftest` runs each problem's own reference design
-through the pipeline; 155 pass under Icarus 12. Exclude what it reports --
-a reference that fails its own testbench is a toolchain gap, and scoring a
-model on it records a failure that has nothing to do with the model.
+156 problems import; 152 are usable. `selftest` applies two checks:
+
+1. **Toolchain.** Run each problem's own reference through the pipeline.
+   One problem fails to compile under Icarus 12.
+2. **Spec sufficiency.** A reference always passes its own testbench, so
+   that alone cannot tell whether the *prompt* is enough to reach it. Three
+   problems have references that rely on an `initial` block for power-on
+   state while the prompt never mentions an initial value, reset, or
+   power-on behaviour. A spec-compliant design starts at `x` and mismatches
+   immediately, so no correct answer can pass. `Prob034_dff8` is the clearest
+   case: an 8-bit DFF that failed 6/6 in an early run purely for this reason.
+
+Both classes are excluded from `usable.json`. Scoring a model on either
+records a failure that belongs to the benchmark, not the model.
 
 These testbenches compare against a golden RefModule, so they need none of the
 hand-validation our own oracles required.
@@ -165,6 +175,34 @@ The summary reports pass rate per level and, more usefully, which problems
 were **rescued** (failed single-shot, passed with the loop) and which
 **regressed**. That contrast is the experiment; the aggregate percentage is
 just its headline.
+
+## Spending a limited token budget well
+
+Free tiers give roughly 65 calls a day at 3K tokens each. Random sampling
+wastes most of that: in one run, four problems passed 6/6 at both levels --
+24 calls that could not have shown a feedback effect, because there was
+nothing to repair.
+
+`problems/discriminating.json` is a 16-problem subset built from observed
+behaviour rather than guesswork:
+
+- **10 discriminating** -- fail single-shot at least sometimes, and the
+  repair loop sometimes recovers them. These carry the signal.
+- **4 hard FSMs** -- multi-output sequential designs that failed every
+  attempt at every level. These mark where feedback stops helping.
+- **2 controls** -- pass reliably at both levels, confirming the pipeline
+  is not the thing causing failures elsewhere.
+
+```bash
+python -m rtlforge.cli benchmark --problems problems/verilogeval \
+    --manifest problems/discriminating.json --levels none full --trials 3 \
+    --model openai/gpt-oss-120b --reasoning-effort low --max-tokens 3072
+```
+
+Rebuild the subset as you learn more: drop anything that passes 6/6, add
+anything that fails interestingly. A problem that always passes and a problem
+that always fails both cost the same tokens; only the ones that change
+behaviour between levels are paying for themselves.
 
 ## Convergence controls
 

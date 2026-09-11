@@ -248,7 +248,7 @@ def cmd_selftest(args) -> int:
         print(f"no problems under {root}", file=sys.stderr)
         return 1
 
-    usable, broken = [], []
+    usable, broken, spec_gap = [], [], []
     for d in dirs:
         try:
             problem = Problem(d)
@@ -276,6 +276,22 @@ def cmd_selftest(args) -> int:
             shutil.copy(e, dst)
             extras.append(dst)
 
+        # A reference always passes its own testbench, so that check alone
+        # cannot tell whether the PROMPT is sufficient to reach it. When the
+        # reference relies on an `initial` block for power-on state and the
+        # prompt never mentions an initial value, reset, or power-on
+        # behaviour, a spec-compliant design starts at x and mismatches on
+        # the first samples. The problem is then unwinnable from its own
+        # prompt, and every failure recorded on it belongs to the benchmark,
+        # not the model. (VerilogEval spec-to-rtl: 3 of 156.)
+        ref_text = ref.read_text()
+        spec_text = (d / "spec.md").read_text() if (d / "spec.md").exists() else ""
+        if re.search(r"^\s*initial\b", ref_text, re.MULTILINE) and not re.search(
+            r"initial|reset|power[- ]?on|starts? (?:at|in)", spec_text, re.I
+        ):
+            spec_gap.append(d.name)
+            continue
+
         c = runners.compile_rtl(design, work, tb=tb, extra=extras)
         if not c.passed:
             msg = c.diagnostics[0].message if c.diagnostics else "compile failed"
@@ -288,9 +304,15 @@ def cmd_selftest(args) -> int:
             msg = sim.diagnostics[0].message if sim.diagnostics else "sim failed"
             broken.append((d.name, f"simulate: {msg}"))
 
-    print(f"usable: {len(usable)}   unusable: {len(broken)}")
+    print(f"usable: {len(usable)}   unusable: {len(broken)}   "
+          f"spec gap: {len(spec_gap)}")
     for name, why in broken:
         print(f"  {name}: {why[:100]}")
+    if spec_gap:
+        print("\nexcluded -- reference needs power-on state the prompt never "
+              "specifies, so no spec-compliant design can pass:")
+        for name in spec_gap:
+            print(f"  {name}")
 
     if args.write_manifest:
         out = root / "usable.json"
@@ -313,10 +335,13 @@ def cmd_benchmark(args) -> int:
     """
     root = Path(args.problems)
     names = None
-    manifest = root / "usable.json"
-    if args.use_manifest and manifest.exists():
+    manifest = Path(args.manifest) if args.manifest else root / "usable.json"
+    if args.manifest or (args.use_manifest and manifest.exists()):
+        if not manifest.exists():
+            print(f"manifest not found: {manifest}", file=sys.stderr)
+            return 1
         names = set(json.loads(manifest.read_text()))
-        print(f"using manifest: {len(names)} problem(s)")
+        print(f"using manifest {manifest}: {len(names)} problem(s)")
 
     dirs = [d for d in sorted(root.iterdir())
             if d.is_dir() and (d / "problem.json").exists()
@@ -575,6 +600,10 @@ def main(argv=None) -> int:
     sp.add_argument("--seed", type=int, default=0)
     sp.add_argument("--use-manifest", action="store_true", default=True,
                     help="honour usable.json from selftest")
+    sp.add_argument("--manifest", default=None,
+                    help="JSON list of problem names to run instead of "
+                         "usable.json; use to focus a limited token budget "
+                         "on problems that actually discriminate")
     sp.add_argument("--out", default=None,
                     help="reuse an existing results dir (with --resume)")
     sp.add_argument("--resume", action="store_true")
