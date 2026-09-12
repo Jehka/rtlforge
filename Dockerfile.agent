@@ -1,15 +1,33 @@
 # Orchestrator. Holds the API key, talks to the model, never runs EDA tools.
 FROM python:3.12-slim
 
+# The agent dispatches tool commands into the eda/pd containers, so it needs
+# the docker CLI -- and only the CLI. The daemon is the host's, reached through
+# the mounted socket.
+#
+# Use docker-cli, NOT docker.io. On Debian, docker.io is the daemon and pulls
+# in containerd, runc and iptables; the client ships separately in docker-cli,
+# which is merely "Recommended" and therefore skipped by
+# --no-install-recommends. Installing docker.io alone gives you 350MB of
+# daemon and no `docker` command.
+#
+# The version check is deliberate: without it a missing CLI surfaces much
+# later as every stage failing for no visible reason.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        docker.io git \
-    && rm -rf /var/lib/apt/lists/*
+        docker-cli git \
+    && rm -rf /var/lib/apt/lists/* \
+    && docker --version
 
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copied so the image works standalone. During development docker-compose
+# bind-mounts the repo over /app instead, so edits take effect without a
+# rebuild -- see the `agent` service volumes.
 COPY rtlforge/ ./rtlforge/
 COPY problems/ ./problems/
+COPY examples/ ./examples/
+COPY tests/ ./tests/
 
 CMD ["sleep", "infinity"]

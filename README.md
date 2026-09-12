@@ -8,6 +8,11 @@ local model and a large cloud one can be closed by giving the small model
 deterministic tool feedback?** Every feedback level is a separate run
 configuration so the ablation is one command.
 
+**Backend architecture: [BACKEND.md](BACKEND.md)** — the spec-to-GDS plan, action-space rules, and cost analysis.
+
+**First complete experiment: [FINDINGS.md](FINDINGS.md)** — 96 runs, 31% → 66%
+on a discriminating subset, with the capability boundary and failure taxonomy.
+
 ## Status
 
 Working: parsers, runners, repair loop, CLI, three validated problems,
@@ -84,7 +89,25 @@ you point it at your own RTL.
 ```bash
 docker compose build
 docker compose up -d
-docker compose exec agent python -m rtlforge.cli run --problem problems/counter
+docker compose ps          # confirm the eda container's name
+
+docker compose exec agent python -m rtlforge.cli check \
+    --problem problems/counter --rtl examples/counter_good.v
+```
+
+The repo is bind-mounted at `/app`, so code and example edits take effect
+without rebuilding. The agent dispatches tool commands into the `eda` container
+via `RTLFORGE_EDA`, already set in the compose file. Both containers see the
+same `work/` directory -- the agent through `/app/work`, the sandbox through
+`/work` -- which is how the netlist written by one is read by the other.
+
+If `docker compose ps` shows a different name than `rtlforge-eda-1` (Compose
+derives it from the folder), override it:
+
+```bash
+docker compose exec -e RTLFORGE_EDA=docker:<actual-name> agent \
+    python -m rtlforge.cli check --problem problems/counter \
+    --rtl examples/counter_good.v
 ```
 
 The `eda` service runs with `network_mode: none`. Generated RTL is untrusted
@@ -210,9 +233,14 @@ The first valid benchmark run showed the loop oscillating on multi-output
 FSMs -- mismatch counts going 522 -> 398 -> 672 -> 504 -> 592, and on another
 problem two byte-identical final attempts. Four controls address that:
 
-- **Stall detection.** An attempt whose RTL hashes identically to an earlier
-  one ends the run with `stop_reason: stalled`. The model has stopped
-  responding to feedback; further iterations cost tokens and change nothing.
+- **Syntactic stall detection.** An attempt whose RTL hashes identically to an
+  earlier one ends the run with `stop_reason: stalled`.
+- **Behavioural stall detection.** A model can rewrite comments and signal
+  names while producing functionally identical RTL -- distinct hash, identical
+  mismatch counts. Observed on multi-output FSMs across three consecutive
+  attempts. Each attempt is therefore also fingerprinted by its *observed
+  failure*; three matches ends the run with
+  `stop_reason: behaviourally stalled`.
 - **Repair history.** Each repair prompt now lists prior attempts and their
   failure magnitudes. Without it the model re-proposes fixes it already made.
 - **Rollback.** If an attempt regresses -- fails at an earlier stage, or

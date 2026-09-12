@@ -1,10 +1,16 @@
-# Two containers, one shared volume, one boundary.
+# Three containers, one shared volume, one security boundary.
 #
-#   agent  -- has the API key and network egress, has no EDA tools
-#   eda    -- has the EDA tools, has NO network and NO key
+#   agent  -- API key and network egress. No EDA tools.
+#   eda    -- Verilator, Icarus, Yosys. Verification stages. No network.
+#   pd     -- OpenROAD-flow-scripts: Yosys, OpenSTA, OpenROAD, PDKs.
+#             Implementation stages. No network.
 #
-# Generated RTL is untrusted input. It is executed only inside `eda`, which
-# cannot reach the internet even if a model emits something hostile.
+# Two EDA containers rather than one image with everything: ORFS ships no
+# simulators, and the verification image ships no backend tools. Each stage
+# dispatches to the container that has what it needs.
+#
+# Generated RTL is untrusted input and executes only in eda/pd, neither of
+# which can reach the internet.
 
 services:
   agent:
@@ -12,12 +18,21 @@ services:
       context: .
       dockerfile: Dockerfile.agent
     env_file: .env
+    environment:
+      # Verification stages -> eda. Backend stages -> pd.
+      # Check names with `docker compose ps`; Compose derives them from the
+      # folder, so a folder named something other than "rtlforge" changes them.
+      RTLFORGE_EDA: docker:rtlforge-eda-1
+      RTLFORGE_PD: docker:rtlforge-pd-1
+      RTLFORGE_EDA_WORKDIR: /work
+      RTLFORGE_LIBERTY: /OpenROAD-flow-scripts/flow/platforms/nangate45/lib/NangateOpenCellLibrary_typical.lib
     volumes:
+      # Bind-mount the repo so edits take effect without rebuilding.
+      - .:/app
       - ./work:/work
       - ./results:/app/results
-      - ./problems:/app/problems:ro
-      # Lets the agent invoke the eda container. Comment this out and run the
-      # two containers by hand if your site forbids socket mounting.
+      # Lets the agent invoke the other containers. Comment out and drive them
+      # by hand if your site forbids socket mounting.
       - /var/run/docker.sock:/var/run/docker.sock
     working_dir: /app
 
@@ -25,7 +40,19 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.eda
-    network_mode: none          # <- the important line
+    command: sleep infinity
+    network_mode: none
+    volumes:
+      - ./work:/work
+    working_dir: /work
+
+  pd:
+    image: openroad/orfs:latest
+    command: sleep infinity
+    network_mode: none
+    environment:
+      # ORFS installs outside the default PATH.
+      PATH: /OpenROAD-flow-scripts/tools/install/OpenROAD/bin:/OpenROAD-flow-scripts/tools/install/yosys/bin:/usr/local/bin:/usr/bin:/bin
     volumes:
       - ./work:/work
     working_dir: /work

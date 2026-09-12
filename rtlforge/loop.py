@@ -46,6 +46,7 @@ class Attempt:
     failed_stage: Optional[str] = None
     magnitude: Optional[float] = None   # fraction of samples mismatching
     rolled_back: bool = False   # this attempt was repaired from an earlier one
+    behaviour: str = ""         # fingerprint of the observed failure
 
 
 @dataclass
@@ -60,6 +61,7 @@ class RunResult:
     wall_clock_s: float = 0.0
     terminal_stage: Optional[str] = None   # failed where this level is blind
     truncated: bool = False                # a response hit the token ceiling
+    candidates_drawn: int = 1              # best-of-N sampling width
     stop_reason: str = ""                  # why the loop ended
     prompt_tokens: int = 0
     completion_tokens: int = 0
@@ -79,11 +81,13 @@ class RunResult:
             "final_cells": self.final_cells,
             "terminal_stage": self.terminal_stage,
             "truncated": self.truncated,
+            "candidates_drawn": self.candidates_drawn,
             "stop_reason": self.stop_reason,
             "attempts": [
                 {"index": a.index, "passed": a.passed, "stages": a.stages,
                  "rtl_hash": a.rtl_hash, "failed_stage": a.failed_stage,
-                 "magnitude": a.magnitude, "rolled_back": a.rolled_back}
+                 "magnitude": a.magnitude, "rolled_back": a.rolled_back,
+                 "behaviour": a.behaviour}
                 for a in self.attempts
             ],
         }
@@ -103,6 +107,25 @@ STAGES_BY_LEVEL = {
 
 # Always run all four. This is the scoreboard.
 SCORING_STAGES = ["lint", "compile", "simulate", "synth"]
+
+# How far down the pipeline a design is taken. Verification and
+# synthesizability apply to every design; timing and physical implementation
+# are opt-in, because they cost minutes to hours per design where simulation
+# costs seconds. Most RTL never needs a layout.
+FLOW_TIERS = {
+    "verify":   ["lint", "compile", "simulate"],
+    "synth":    ["lint", "compile", "simulate", "synth"],          # default
+    "map":      ["lint", "compile", "simulate", "synth", "map"],
+    "sta":      ["lint", "compile", "simulate", "synth", "map", "sta"],
+    "gds":      ["lint", "compile", "simulate", "synth", "map", "sta",
+                 "floorplan", "place", "cts", "route", "gds"],     # not built
+}
+
+# Stages where a failure is repaired by rewriting the RTL. Beyond this, the
+# fix is a constraint or a tool parameter, and letting the agent edit RTL
+# there produces designs that chase timing by mangling the logic. See
+# BACKEND.md for the action-space table.
+RTL_ACTION_STAGES = {"lint", "compile", "simulate", "synth", "map", "sta"}
 
 
 class Problem:
@@ -142,6 +165,23 @@ def _generate_prompt(problem: Problem) -> List[dict]:
 
 STAGE_RANK = {"generate": 0, "lint": 1, "compile": 2, "simulate": 3,
               "synth": 4, None: 5}
+
+
+def _behaviour_key(stage_name: str, stage: dict) -> str:
+    """Fingerprint what the tools observed, independent of how the RTL reads.
+
+    Built from the failing stage plus the diagnostic messages, which for a
+    simulation failure include the per-output mismatch counts and first
+    mismatch times. Two attempts sharing this key are functionally the same
+    design however differently they are written.
+    """
+    msgs = sorted(
+        d.get("message", "") for d in stage.get("diagnostics", [])
+        if d.get("code") != "HINT" or "mismatch" in d.get("message", "").lower()
+    )
+    return hashlib.sha256(
+        (stage_name + "|" + "|".join(msgs)).encode()
+    ).hexdigest()[:12]
 
 
 def _magnitude_from(stage: dict) -> Optional[float]:
@@ -220,6 +260,28 @@ def _generate(client, messages, result) -> str:
     return extract_verilog(text)
 
 
+def _score_candidate(problem: Problem, rtl: str, workdir: Path,
+                     tb: Path, extra: List[Path], strict_lint: bool) -> tuple:
+    """Run a candidate through the pipeline and rank it. Higher is better."""
+    design = workdir / DESIGN_FILENAME
+    design.write_text(rtl)
+    for name in SCORING_STAGES:
+        if name == "lint":
+            sr = runners.lint(design, workdir, strict=strict_lint)
+        elif name == "compile":
+            sr = runners.compile_rtl(design, workdir, tb=tb, extra=extra)
+        elif name == "simulate":
+            sr = runners.simulate(workdir, sim_format=problem.sim_format)
+        else:
+            sr = runners.synthesize(design, workdir, problem.top)
+        if sr.skipped:
+            continue
+        if not sr.passed:
+            mag = failure_magnitude(sr.diagnostics)
+            return (STAGE_RANK.get(name, 0), -(mag if mag is not None else 1.0))
+    return (STAGE_RANK[None], 0.0)
+
+
 def run_problem(
     problem: Problem,
     client: LLMClient,
@@ -227,6 +289,7 @@ def run_problem(
     feedback_level: str = "full",
     max_iterations: int = 5,
     strict_lint: bool = False,
+    candidates: int = 1,
 ) -> RunResult:
     if feedback_level not in STAGES_BY_LEVEL:
         raise ValueError(
@@ -259,8 +322,36 @@ def run_problem(
 
     start = time.time()
     messages = _generate_prompt(problem)
-    rtl = _generate(client, messages, result)
+
+    # Best-of-N sampling. MAGE reports a large gain from drawing several
+    # candidates at higher temperature and keeping the one that gets furthest
+    # through the tools -- the tools, not the model, pick the winner. N=1
+    # keeps the original single-draw behaviour.
+    if candidates > 1:
+        saved_temp = client.temperature
+        client.temperature = max(saved_temp, 0.8)
+        best_rtl_c, best_score = None, None
+        for _ in range(candidates):
+            cand = _generate(client, messages, result)
+            if f"module {problem.top}" not in cand:
+                continue
+            score = _score_candidate(problem, cand, workdir, tb_local,
+                                     extra_local, strict_lint)
+            if best_score is None or score > best_score:
+                best_rtl_c, best_score = cand, score
+        client.temperature = saved_temp
+        result.candidates_drawn = candidates
+        rtl = best_rtl_c if best_rtl_c else _generate(client, messages, result)
+    else:
+        rtl = _generate(client, messages, result)
     seen_hashes: set = set()
+    # Behavioural fingerprints, not just textual ones. A model can rewrite
+    # comments and signal names while producing functionally identical RTL --
+    # the hash changes, the behaviour does not, and the loop pays for
+    # iterations that cannot help. Observed on multi-output FSMs: three
+    # consecutive attempts with distinct hashes and an identical mismatch
+    # count.
+    seen_behaviour: dict = {}
     best: Optional[Attempt] = None
     best_rtl = rtl
 
@@ -336,6 +427,12 @@ def run_problem(
             if not sr.passed:
                 failed_stage = stage
                 feedback = render_feedback(sr.diagnostics)
+                if sr.waveform:
+                    feedback += (
+                        "\n\nSignal trace around the first mismatch "
+                        "(_ref is correct, _dut is yours):\n```\n"
+                        + sr.waveform + "\n```"
+                    )
                 break
             if stage == "synth" and sr.metrics:
                 result.final_cells = sr.metrics.cells
@@ -344,12 +441,22 @@ def run_problem(
         attempt.failed_stage = failed_stage
         if failed_stage and attempt.stages:
             attempt.magnitude = _magnitude_from(attempt.stages[-1])
+            attempt.behaviour = _behaviour_key(failed_stage, attempt.stages[-1])
         result.attempts.append(attempt)
 
         if attempt.passed:
             result.passed = True
             result.stop_reason = "passed"
             break
+
+        # Three attempts with the same observable failure means the loop is
+        # exploring rewordings, not fixes.
+        if attempt.behaviour:
+            seen_behaviour[attempt.behaviour] = \
+                seen_behaviour.get(attempt.behaviour, 0) + 1
+            if seen_behaviour[attempt.behaviour] >= 3:
+                result.stop_reason = "behaviourally stalled"
+                break
         if feedback_level == "none":
             result.stop_reason = "single-shot"
             break

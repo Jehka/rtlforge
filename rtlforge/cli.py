@@ -89,6 +89,7 @@ def cmd_run(args) -> int:
         feedback_level=args.level,
         max_iterations=args.max_iterations,
         strict_lint=args.strict_lint,
+        candidates=args.candidates,
     )
 
     out = _results_dir(Path(args.results_root))
@@ -125,6 +126,7 @@ def cmd_sweep(args) -> int:
                     feedback_level=level,
                     max_iterations=args.max_iterations,
                     strict_lint=args.strict_lint,
+                    candidates=args.candidates,
                 )
             except LLMError as e:
                 # A sweep that crashes on the last trial must not discard the
@@ -559,6 +561,9 @@ def main(argv=None) -> int:
         sp.add_argument("--reasoning-effort", default=None,
                         choices=["low", "medium", "high"],
                         help="gpt-oss models only; 'low' cuts token use ~3x")
+        sp.add_argument("--candidates", type=int, default=1,
+                        help="best-of-N sampling at higher temperature; the "
+                             "tools pick the winner. Costs N generations.")
         sp.add_argument("--max-tokens", type=int, default=8192,
                         help="per-response ceiling; also reserved against "
                              "tokens-per-minute, so lower it if you see 429s")
@@ -616,6 +621,7 @@ def main(argv=None) -> int:
     sp.add_argument("--strict-lint", action="store_true")
     sp.add_argument("--reasoning-effort", default=None,
                     choices=["low", "medium", "high"])
+    sp.add_argument("--candidates", type=int, default=1)
     sp.add_argument("--max-tokens", type=int, default=8192)
     sp.set_defaults(func=cmd_benchmark)
 

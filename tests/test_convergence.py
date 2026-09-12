@@ -111,3 +111,31 @@ def test_history_reaches_the_repair_prompt(tmp_path):
                 feedback_level="full", max_iterations=4)
     final_prompt = client.last_messages[-1]["content"]
     assert "Attempts so far:" in final_prompt
+
+
+def test_waveform_window_renders_ref_and_dut(tmp_path):
+    """The trace must show what the design did, not just that it failed."""
+    from rtlforge.waveform import first_mismatch_time, window_at
+
+    vcd = tmp_path / "wave.vcd"
+    vcd.write_text(
+        "$timescale 1ps $end\n"
+        "$var wire 1 ! clk $end\n"
+        "$var wire 1 # q_ref $end\n"
+        "$var wire 1 $ q_dut $end\n"
+        "$enddefinitions $end\n"
+        "#0\n0!\n0#\n0$\n"
+        "#5\n1!\n1#\n0$\n"
+        "#10\n0!\n1#\n0$\n"
+    )
+    assert first_mismatch_time("First mismatch occurred at time 5") == 5
+    text = window_at(vcd, 5)
+    assert "q_ref" in text and "q_dut" in text
+    assert "first mismatch" in text
+    # ref/dut pairs must sit next to each other to be readable
+    assert text.index("q_ref") < text.index("q_dut")
+
+
+def test_waveform_missing_file_is_not_fatal(tmp_path):
+    from rtlforge.waveform import window_at
+    assert window_at(tmp_path / "nope.vcd", 10) == ""
