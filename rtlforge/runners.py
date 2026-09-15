@@ -69,6 +69,24 @@ class StageResult:
         }
 
 
+def make_workdir(path: Path) -> Path:
+    """Create a work directory both containers can write to.
+
+    The agent runs as root; the EDA sandbox runs as a non-root user so that
+    generated RTL does not execute with root privileges. A root-owned work
+    directory therefore looks writable to the agent and read-only to the tool
+    that actually needs to write into it -- which shows up as a stage that
+    fails with no diagnostics, because the tool never got far enough to
+    produce any.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o777)
+    except OSError:
+        pass  # non-POSIX or already owned by someone else; not fatal
+    return path
+
+
 def _wrap(cmd: List[str], cwd: Path, backend: Optional[str] = None) -> List[str]:
     """Rewrite a command for the configured backend."""
     backend = backend or EDA_BACKEND

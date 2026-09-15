@@ -298,8 +298,7 @@ def run_problem(
         )
 
     repair_stages = STAGES_BY_LEVEL[feedback_level]
-    workdir = Path(workdir)
-    workdir.mkdir(parents=True, exist_ok=True)
+    workdir = runners.make_workdir(Path(workdir))
 
     # The trusted testbench is copied in fresh each run and never regenerated.
     tb_local = workdir / problem.tb_path.name

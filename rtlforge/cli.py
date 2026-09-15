@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
 import re
 import shutil
@@ -34,8 +35,7 @@ def cmd_check(args) -> int:
     will, and debugging it with a model in the loop is far harder.
     """
     problem = Problem(Path(args.problem))
-    work = Path(args.workdir) / "check"
-    work.mkdir(parents=True, exist_ok=True)
+    work = runners.make_workdir(Path(args.workdir) / "check")
 
     design = work / "design.v"
     shutil.copy(args.rtl, design)
@@ -66,10 +66,98 @@ def cmd_check(args) -> int:
         print(f"[{status:4}] {name}{detail}{'  ' + sr.note if sr.note else ''}")
         for d in sr.diagnostics:
             print(f"         {d.render()}")
+        if not sr.passed and not sr.skipped and not sr.diagnostics:
+            tail = [l for l in (sr.raw or "").strip().splitlines() if l.strip()]
+            print("         raw output (unparsed):")
+            for line in (tail[-8:] or ["(no output captured)"]):
+                print(f"           {line}")
         if not sr.passed and not sr.skipped:
             ok = False
             break
     return 0 if ok else 1
+
+
+def cmd_flow(args) -> int:
+    """Run a design through the pipeline as far as `--through`. No LLM.
+
+    The backend counterpart to `check`: same idea, but it continues past
+    generic synthesis into technology mapping and static timing. Use it to
+    confirm the toolchain works before putting an agent in the loop -- the
+    same discipline that caught every harness bug in this project.
+    """
+    from . import backend
+    from .loop import FLOW_TIERS
+
+    problem = Problem(Path(args.problem))
+    work = runners.make_workdir(Path(args.workdir) / "flow")
+
+    design = work / "design.v"
+    shutil.copy(args.rtl, design)
+    tb = work / problem.tb_path.name
+    shutil.copy(problem.tb_path, tb)
+    extra = []
+    for e in problem.extra_sources:
+        dst = work / e.name
+        shutil.copy(e, dst)
+        extra.append(dst)
+
+    liberty = Path(args.liberty or os.environ.get("RTLFORGE_LIBERTY", ""))
+
+    stages = FLOW_TIERS[args.through]
+    for name in stages:
+        if name == "lint":
+            sr = runners.lint(design, work)
+        elif name == "compile":
+            sr = runners.compile_rtl(design, work, tb=tb, extra=extra)
+        elif name == "simulate":
+            sr = runners.simulate(work, sim_format=problem.sim_format)
+        elif name == "synth":
+            sr = runners.synthesize(design, work, problem.top)
+        elif name == "map":
+            sr = backend.techmap(design, work, problem.top, liberty)
+        elif name == "sta":
+            sr = backend.run_sta(work, problem.top, liberty,
+                                 args.clock_port, args.clock_period)
+        else:
+            print(f"[TODO] {name}  not implemented yet")
+            continue
+
+        status = "SKIP" if sr.skipped else ("PASS" if sr.passed else "FAIL")
+        detail = ""
+        if getattr(sr, "map_metrics", None) and sr.map_metrics.area_um2:
+            m = sr.map_metrics
+            detail = f"  area={m.area_um2:.2f}um2 cells={m.cells} flops={m.flops}"
+            if m.seq_area_um2 and m.area_um2:
+                detail += f" (seq {100 * m.seq_area_um2 / m.area_um2:.0f}%)"
+        elif getattr(sr, "timing", None) and sr.timing.wns is not None:
+            t = sr.timing
+            detail = f"  WNS={t.wns:+.3f}ns @ {t.clock_period_ns}ns"
+            if t.fmax_mhz:
+                detail += f"  (Fmax {t.fmax_mhz:.0f}MHz)"
+        elif sr.metrics and sr.metrics.cells is not None:
+            detail = f"  cells={sr.metrics.cells}"
+
+        print(f"[{status:4}] {name}{detail}"
+              + (f"  {sr.note}" if sr.note else ""))
+        for d in sr.diagnostics:
+            print(f"         {d.render()}")
+
+        # A failure with nothing to show means the parser did not recognise
+        # the output -- a permission error, a missing file, a tool message in
+        # an unexpected format. Printing the raw tail turns a blank FAIL into
+        # something actionable.
+        if not sr.passed and not sr.skipped and not sr.diagnostics:
+            tail = [l for l in (sr.raw or "").strip().splitlines() if l.strip()]
+            if tail:
+                print("         raw output (unparsed):")
+                for line in tail[-8:]:
+                    print(f"           {line}")
+            else:
+                print("         (no output captured)")
+
+        if not sr.passed and not sr.skipped:
+            return 1
+    return 0
 
 
 def cmd_run(args) -> int:
@@ -263,8 +351,7 @@ def cmd_selftest(args) -> int:
             # Our hand-written problems have no reference; skip quietly.
             continue
 
-        work = Path(args.workdir) / "selftest" / d.name
-        work.mkdir(parents=True, exist_ok=True)
+        work = runners.make_workdir(Path(args.workdir) / "selftest" / d.name)
         design = work / "design.v"
         # The reference IS the correct answer, renamed to the expected top.
         design.write_text(
@@ -573,6 +660,23 @@ def main(argv=None) -> int:
     sp.add_argument("--rtl", required=True)
     sp.add_argument("--workdir", default="work")
     sp.set_defaults(func=cmd_check)
+
+    sp = sub.add_parser(
+        "flow", help="run a design through verify -> synth -> map -> sta")
+    sp.add_argument("--problem", required=True)
+    sp.add_argument("--rtl", required=True)
+    sp.add_argument("--workdir", default="work")
+    sp.add_argument("--through", default="sta",
+                    choices=["verify", "synth", "map", "sta", "gds"],
+                    help="how far to take the design; physical design is "
+                         "opt-in, not automatic")
+    sp.add_argument("--liberty", default=None,
+                    help="standard-cell library (default: $RTLFORGE_LIBERTY)")
+    sp.add_argument("--clock-port", default="clk")
+    sp.add_argument("--clock-period", type=float, default=2.0,
+                    help="ns; the constraint timing is measured against and "
+                         "which the agent may never change")
+    sp.set_defaults(func=cmd_flow)
 
     sp = sub.add_parser("run", help="one problem, one feedback level")
     common(sp)

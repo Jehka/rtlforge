@@ -171,3 +171,95 @@ def test_unrunnable_lint_fails_rather_than_passing(tmp_path, monkeypatch):
     sr = R.lint(design, tmp_path)
     assert not sr.passed, "a tool that never ran must not report success"
     assert "did not run" in sr.note
+
+
+def test_liberty_existence_is_not_checked_against_the_wrong_filesystem(
+        tmp_path, monkeypatch):
+    """Under a container backend the liberty lives in that container.
+
+    Checking for it locally skips a stage that would have worked.
+    """
+    import rtlforge.backend as B
+
+    monkeypatch.setattr(B, "PD_BACKEND", "docker:some-container")
+    monkeypatch.setattr(B, "_run", lambda *a, **k: (0, "Chip area for module 'm': 5.0\n"))
+    monkeypatch.setattr(B, "_missing", lambda *a, **k: None)
+    (tmp_path / "mapped.v").write_text("// netlist\n")
+    (tmp_path / "design.v").write_text("module m; endmodule\n")
+
+    sr = B.techmap(tmp_path / "design.v", tmp_path, "m",
+                   Path("/only/exists/inside/the/container.lib"))
+    assert not sr.skipped, "must not skip on a path it cannot see"
+    assert sr.passed
+
+
+def test_cell_tally_parses_both_yosys_stat_layouts():
+    """Yosys changed the stat layout and both versions are in the wild.
+
+    0.33:  `Number of cells: 11` then `     DFFR_X1   4`
+    0.68:  `       11   31.122 cells` then `        4   21.28   DFFR_X1`
+
+    The newer format puts the count first, so a parser written for the older
+    one reads the leading digit as a cell name and returns nothing -- area
+    parses, cells come back None. Caught in the ORFS container, which ships
+    0.68 while the dev box had 0.33.
+    """
+    from rtlforge.backend import parse_techmap
+
+    new_layout = """
+       15        - wires
+       11   31.122 cells
+        4    21.28   DFFR_X1
+        1    1.862   MUX2_X1
+        3    4.788   XNOR2_X1
+
+   Chip area for module 'counter_en': 31.122000
+     of which used for sequential elements: 21.280000 (68.38%)
+"""
+    old_layout = """
+   Number of cells:                 11
+     DFFR_X1                         4
+     MUX2_X1                         1
+     XNOR2_X1                        3
+
+   Chip area for module 'counter_en': 31.122000
+"""
+    for label, out in [("0.68", new_layout), ("0.33", old_layout)]:
+        m, _ = parse_techmap(out)
+        assert m.cells == 11, f"cell count failed on yosys {label}"
+        assert m.flops == 4, f"flop count failed on yosys {label}"
+        assert m.area_um2 == pytest.approx(31.122)
+        assert m.cell_mix["XNOR2_X1"] == 3
+
+    # Sequential area is only reported by the newer format.
+    m_new, _ = parse_techmap(new_layout)
+    assert m_new.seq_area_um2 == pytest.approx(21.28)
+
+
+def test_total_cells_never_counts_the_summary_line_as_a_cell():
+    from rtlforge.backend import parse_techmap
+    m, _ = parse_techmap("       11   31.122 cells\n        4    21.28   DFFR_X1\n")
+    assert "cells" not in m.cell_mix
+    assert m.cells == 11
+
+
+def test_fmax_only_from_register_to_register_paths():
+    """An I/O worst path describes the constraint, not the logic.
+
+    write_sdc scales I/O delay with the period, so a loose clock makes the
+    input path critical. Reporting Fmax from it gives one design two
+    different frequencies at two different clock periods.
+    """
+    from rtlforge.backend import parse_sta
+
+    io_path = STA_MET.replace(
+        "Startpoint: r2 (rising edge-triggered flip-flop clocked by clk)",
+        "Startpoint: in1 (input port clocked by clk)",
+    )
+    t, _ = parse_sta(io_path, clock_period_ns=10.0)
+    assert t.wns == 9.43
+    assert not t.reg_to_reg
+    assert t.fmax_mhz is None
+
+    t2, _ = parse_sta(STA_MET, clock_period_ns=10.0)
+    assert t2.reg_to_reg and t2.fmax_mhz is not None

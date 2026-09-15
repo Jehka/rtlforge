@@ -44,7 +44,27 @@ SDC_IS_IMMUTABLE = True
 # ------------------------------------------------------------ technology map
 
 _AREA_RE = re.compile(r"Chip area for module '[^']*':\s*(?P<area>[\d.]+)")
-_CELL_RE = re.compile(r"^\s{5}(?P<cell>[A-Za-z_][\w]*)\s+(?P<n>\d+)\s*$")
+_SEQ_AREA_RE = re.compile(
+    r"used for sequential elements:\s*(?P<area>[\d.]+)"
+)
+
+# Yosys changed the `stat` layout between versions and both are in the wild:
+#
+#   0.33 and earlier          0.68 and later
+#   --------------------      ------------------------
+#   Number of cells:  11             11   31.122 cells
+#        DFFR_X1       4              4    21.28   DFFR_X1
+#
+# The newer format puts the count first and the name last, so a parser written
+# for one reads the other's leading digit as a cell name and silently returns
+# nothing -- which is how this surfaced: area parsed, cells came back None.
+_CELL_OLD_RE = re.compile(r"^\s+(?P<cell>[A-Za-z_][\w]*)\s+(?P<n>\d+)\s*$")
+_CELL_NEW_RE = re.compile(
+    r"^\s+(?P<n>\d+)\s+(?P<area>[\d.]+)\s+(?P<cell>[A-Za-z_][\w]*)\s*$"
+)
+_TOTAL_OLD_RE = re.compile(r"Number of cells:\s+(?P<n>\d+)")
+_TOTAL_NEW_RE = re.compile(r"^\s+(?P<n>\d+)\s+[\d.]+\s+cells\s*$", re.M)
+_NOT_A_CELL = re.compile(r"^\s*(Number|Chip|Estimated|Area)\b")
 
 
 @dataclass
@@ -53,32 +73,56 @@ class MapMetrics:
     cells: Optional[int] = None
     cell_mix: dict = field(default_factory=dict)
     flops: Optional[int] = None
+    seq_area_um2: Optional[float] = None   # area in flops; high share = state-heavy
 
 
 def parse_techmap(output: str) -> tuple[MapMetrics, List[Diagnostic]]:
-    """Parse `stat -liberty` output after mapping to a real cell library."""
+    """Parse `stat -liberty` output after mapping to a real cell library.
+
+    Handles both Yosys stat layouts; see the regex block above.
+    """
     diags = [
         Diagnostic("error", None, "YOSYS", line.strip()[7:])
         for line in output.splitlines() if line.strip().startswith("ERROR:")
     ]
 
-    areas = _AREA_RE.findall(output)
-    mix = {}
+    mix: dict = {}
     for line in output.splitlines():
-        m = _CELL_RE.match(line.rstrip())
+        if _NOT_A_CELL.match(line):
+            continue
+        stripped = line.rstrip()
+        m = _CELL_NEW_RE.match(stripped)
+        if m and m.group("cell") != "cells":
+            mix[m.group("cell")] = int(m.group("n"))
+            continue
+        m = _CELL_OLD_RE.match(stripped)
         if m:
             mix[m.group("cell")] = int(m.group("n"))
 
-    counts = re.findall(r"Number of cells:\s+(\d+)", output)
+    total = None
+    m = _TOTAL_NEW_RE.search(output)
+    if m:
+        total = int(m.group("n"))
+    else:
+        counts = _TOTAL_OLD_RE.findall(output)
+        if counts:
+            total = int(counts[-1])
+    if total is None and mix:
+        total = sum(mix.values())
+
+    areas = _AREA_RE.findall(output)
+    seq = _SEQ_AREA_RE.search(output)
+
     # Flop count is the headline sequential metric and a good sanity check:
     # a design that should have 4 registers and maps to 40 has a problem.
     flops = sum(n for c, n in mix.items() if re.match(r"^(DFF|SDFF|DLH|DLL)", c))
 
     return MapMetrics(
         area_um2=float(areas[-1]) if areas else None,
-        cells=int(counts[-1]) if counts else None,
+        cells=total,
         cell_mix=mix,
         flops=flops or None,
+        seq_area_um2=float(seq.group("area")) if seq else None,
     ), diags
 
 
@@ -91,9 +135,16 @@ def techmap(design: Path, workdir: Path, top: str, liberty: Path) -> StageResult
     """
     if (miss := _missing("yosys", "map", backend=PD_BACKEND)):
         return miss
-    if not liberty.exists():
+    # Only meaningful locally: under a container backend the liberty lives in
+    # that container's filesystem, not this one. Checking here would skip a
+    # stage that would have worked -- the same mistake as looking for a tool
+    # on the agent's PATH when it runs in the sandbox.
+    if PD_BACKEND == "local" and not liberty.exists():
         return StageResult("map", False, skipped=True,
                            note=f"liberty file not found: {liberty}")
+    if not str(liberty):
+        return StageResult("map", False, skipped=True,
+                           note="no liberty file set (RTLFORGE_LIBERTY)")
 
     script = (
         f"read_verilog -sv {design.name}; "
@@ -139,13 +190,30 @@ class TimingResult:
     violated: bool = False
 
     @property
+    def reg_to_reg(self) -> bool:
+        """Whether the worst path runs between two flip-flops."""
+        return ("flip-flop" in self.startpoint and
+                "flip-flop" in self.endpoint)
+
+    @property
     def fmax_mhz(self) -> Optional[float]:
         """Achievable frequency implied by the worst path.
 
-        Only meaningful with both the constraint and the slack: a great WNS
-        against a 100ns clock is not an achievement.
+        Requires three things, and returns None without any of them:
+
+        * the slack,
+        * the constraint it was measured against -- a great WNS against a
+          100ns clock is not an achievement,
+        * a register-to-register worst path. `write_sdc` scales I/O delay as
+          a fraction of the period, so at a loose constraint the worst path
+          is often an input or output path. Deriving a frequency from that
+          describes the constraint, not the logic, and produces the
+          contradiction of one design reporting two different Fmax values at
+          two different clock periods.
         """
         if self.wns is None or self.clock_period_ns is None:
+            return None
+        if not self.reg_to_reg:
             return None
         achieved = self.clock_period_ns - self.wns
         return 1000.0 / achieved if achieved > 0 else None
