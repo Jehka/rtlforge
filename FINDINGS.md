@@ -140,10 +140,18 @@ broken version fails simulation rather than timing -- gets rolled back to its
 slower but correct design and never revisits the idea. The loop's own
 correctness guarantee is what discards the better approach.
 
-That suggests a concrete direction: when a timing repair regresses to a
-*functional* failure, the useful feedback is the functional diagnostic on the
-new structure, not a revert to the old one. Current rollback treats "wrong"
-and "slow" as points on one scale, and here they are not.
+That suggested a concrete fix, since implemented: when a timing repair
+regresses to a *functional* failure, the loop no longer reverts on the first
+attempt. The new structure gets one chance to be corrected, with a prompt
+that says to keep it and repair only what is wrong. Rollback had been
+treating "wrong" and "slow" as points on one scale, and here they are not --
+a correct-but-slow design outranks a nearly-correct fast one, so the better
+idea is discarded precisely when it is closest to working.
+
+The rescue is gated to once per run: a structure that does not come good
+after one correction reverts normally rather than consuming the whole
+iteration budget. Whether this recovers the carry-lookahead case in practice
+is the next thing to measure.
 
 ## A synthesis caveat worth stating
 

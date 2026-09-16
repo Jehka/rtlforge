@@ -54,6 +54,7 @@ CASES = [
     # Model-generated carry-lookahead: right structure, one off-by-one.
     ("adder32", "adder32_cla_offbyone_bug.v", "simulate"),
     ("adder32", "adder32_cla_fixed.v", None),
+    ("adder32", "adder32_cla_arithmetic.v", None),
 ]
 
 

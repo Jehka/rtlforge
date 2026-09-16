@@ -48,6 +48,7 @@ class Attempt:
     magnitude: Optional[float] = None   # fraction of samples mismatching
     rolled_back: bool = False   # this attempt was repaired from an earlier one
     behaviour: str = ""         # fingerprint of the observed failure
+    from_timing_repair: bool = False   # produced while restructuring for speed
 
 
 @dataclass
@@ -92,7 +93,8 @@ class RunResult:
                 {"index": a.index, "passed": a.passed, "stages": a.stages,
                  "rtl_hash": a.rtl_hash, "failed_stage": a.failed_stage,
                  "magnitude": a.magnitude, "rolled_back": a.rolled_back,
-                 "behaviour": a.behaviour}
+                 "behaviour": a.behaviour,
+                 "from_timing_repair": a.from_timing_repair}
                 for a in self.attempts
             ],
         }
@@ -304,6 +306,52 @@ def _timing_repair_prompt(problem: Problem, rtl: str, feedback: str,
     ]
 
 
+RESTRUCTURE_FIX_PROMPT = (
+    "You are an RTL design engineer. The module below was a deliberate "
+    "restructuring to reduce critical-path delay, and the new structure is "
+    "worth keeping -- but it has a functional bug. Fix the bug WITHOUT "
+    "reverting to the simpler, slower structure you started from. Respond "
+    "with exactly one fenced code block containing the complete corrected "
+    "module and nothing else."
+)
+
+
+def _restructure_fix_prompt(problem: Problem, rtl: str, stage: str,
+                            feedback: str, history: str = "") -> List[dict]:
+    """Repair a functional bug introduced while closing timing.
+
+    This exists because of an observed failure: the model replaced a ripple
+    adder with a complete carry-lookahead adder -- the correct transformation
+    -- and got one line wrong, using each bit's carry-out where the sum needed
+    its carry-in. That version failed simulation, so rollback discarded it and
+    returned the slower correct design, which the loop then reproduced three
+    times.
+
+    Reverting was the wrong move. The structure was right and the bug was one
+    line. Telling the model to keep the structure and fix the bug is the
+    difference between exploring a better design and abandoning it.
+    """
+    return [
+        {"role": "system", "content": RESTRUCTURE_FIX_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Specification for module `{problem.top}`:\n\n{problem.spec}\n\n"
+                f"This is a restructured implementation intended to close "
+                f"timing at {problem.clock_period_ns}ns. It failed at the "
+                f"{stage} stage:\n\n"
+                f"```verilog\n{rtl}\n```\n\n"
+                f"Diagnostics:\n{feedback}\n"
+                f"{history}\n"
+                "Keep this structure. Fix only what is functionally wrong. "
+                "Do not replace it with a simpler implementation -- the point "
+                "of the restructuring was speed, and a correct slow version "
+                "has already been tried."
+            ),
+        },
+    ]
+
+
 def _repair_prompt(problem: Problem, rtl: str, stage: str,
                    feedback: str, history: str = "") -> List[dict]:
     return [
@@ -439,6 +487,10 @@ def run_problem(
     seen_behaviour: dict = {}
     best: Optional[Attempt] = None
     best_rtl = rtl
+    # One rescue per run: if the corrected restructuring still fails, revert
+    # normally rather than chasing a structure that will not come good.
+    restructure_rescued = False
+    last_was_timing_repair = False
 
     # "none" is single-shot: generate, score once, never repair.
     iterations = 1 if feedback_level == "none" else max_iterations
@@ -454,7 +506,8 @@ def run_problem(
         # attempting something more ambitious and mis-writing it. That is only
         # visible if the broken attempts survive.
         (workdir / f"attempt_{i:02d}.v").write_text(rtl)
-        attempt = Attempt(index=i, rtl=rtl, rtl_hash=rtl_hash)
+        attempt = Attempt(index=i, rtl=rtl, rtl_hash=rtl_hash,
+                          from_timing_repair=last_was_timing_repair)
 
         # An identical regeneration means the model has stopped responding to
         # feedback. Further iterations cost tokens and change nothing.
@@ -593,19 +646,40 @@ def run_problem(
         # this the loop can repair a worse design into an even worse one --
         # observed as attempts that introduce new lint errors after previously
         # passing lint.
-        if best is None or _progress(attempt) >= _progress(best):
+        #
+        # Exception: a functional failure introduced BY a timing repair. By
+        # stage rank that scores far below the correct-but-slow design it
+        # replaced, so plain rollback discards it -- which is how a complete
+        # carry-lookahead adder with a one-line bug was thrown away in favour
+        # of the ripple adder it was meant to improve on. Give the new
+        # structure one attempt to be corrected before reverting.
+        rescue_restructure = (
+            attempt.from_timing_repair
+            and failed_stage in ("lint", "compile", "simulate")
+            and not restructure_rescued
+        )
+        if rescue_restructure:
+            restructure_rescued = True
+            repair_from, rolled = rtl, False
+        elif best is None or _progress(attempt) >= _progress(best):
             best, best_rtl = attempt, rtl
             repair_from, rolled = rtl, False
         else:
             repair_from, rolled = best_rtl, True
 
         history = _history_block(result.attempts)
-        prompt = (
-            _timing_repair_prompt(problem, repair_from, feedback, history)
-            if failed_stage == "sta"
-            else _repair_prompt(problem, repair_from, failed_stage, feedback,
-                                history)
-        )
+        if failed_stage == "sta":
+            prompt = _timing_repair_prompt(problem, repair_from, feedback,
+                                           history)
+            last_was_timing_repair = True
+        elif rescue_restructure:
+            prompt = _restructure_fix_prompt(problem, repair_from,
+                                             failed_stage, feedback, history)
+            last_was_timing_repair = True   # still inside the restructuring
+        else:
+            prompt = _repair_prompt(problem, repair_from, failed_stage,
+                                    feedback, history)
+            last_was_timing_repair = False
         rtl = _generate(client, prompt, result)
         if rolled:
             # Mark the attempt this repair was based on, not the one it replaced.

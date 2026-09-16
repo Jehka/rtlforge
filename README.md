@@ -284,6 +284,22 @@ Two things make this an optimisation loop rather than a second repair loop:
   agent can relax. A design that meets timing because the clock slowed has not
   improved. Set it in `problem.json` via `clock_period_ns`.
 
+### Rescuing a restructuring
+
+A timing repair that introduces a functional bug is **not** rolled back on its
+first failure. By stage rank a simulation failure scores far below the
+correct-but-slow design it replaced, so plain rollback discards it -- which is
+how a complete carry-lookahead adder with a one-line error was thrown away in
+favour of the ripple adder it was meant to improve on, after which the loop
+reproduced the slow design three times.
+
+The new structure gets one attempt to be corrected, with a prompt that says
+to keep it and fix only what is wrong. If the correction also fails, normal
+rollback resumes -- the rescue is once per run, so a structure that will not
+come good cannot consume the whole iteration budget.
+
+`from_timing_repair` on each attempt records which path produced it.
+
 Violated timing is recorded even on a failing run -- `final_wns_ns` is the
 measurement you most want when the loop does not converge.
 

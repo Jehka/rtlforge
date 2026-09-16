@@ -234,3 +234,83 @@ def test_every_attempt_is_written_to_disk(tmp_path, monkeypatch):
     saved = sorted(p.name for p in tmp_path.glob("attempt_*.v"))
     assert len(saved) >= 2, f"attempts not preserved: {saved}"
     assert saved[0] == "attempt_01.v"
+
+
+# --- rescuing a restructuring that broke functionally ---
+
+def test_functional_break_after_timing_repair_is_not_reverted(
+        tmp_path, monkeypatch):
+    """The failure this fix exists for.
+
+    The model replaced a ripple adder with a correct carry-lookahead adder
+    and got one line wrong. That version failed simulation, so rollback threw
+    it away and returned the slower correct design -- which the loop then
+    reproduced three times. The structure was right; the bug was one line.
+    """
+    _stub_backend(monkeypatch)
+
+    RIPPLE = "module counter_en(input clk); endmodule // slow but correct\n"
+    CLA_BROKEN = "module counter_en(input clk); endmodule // fast, one bug\n"
+
+    class Scripted:
+        provider = model = "stub"
+        last_finish_reason = "stop"
+
+        def __init__(self):
+            self.usage = Usage()
+            self.prompts = []
+            self.n = 0
+
+        def chat(self, messages, max_tokens=None):
+            self.n += 1
+            self.prompts.append(messages)
+            # 1: slow-but-correct -> fails timing
+            # 2: restructured, functionally broken -> must NOT be reverted
+            return ("```verilog\n"
+                    + (CLA_BROKEN if self.n == 2 else RIPPLE)
+                    + f"// rev{self.n}\n```")
+
+    # attempt 2 (the restructuring) fails lint; everything else fails timing
+    real_lint = R.lint
+    calls = {"n": 0}
+
+    def fake_lint(design, workdir, strict=False):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return R.StageResult("lint", False, [Diagnostic(
+                "error", 12, None, "width mismatch in carry chain")], "")
+        return R.StageResult("lint", True, [], "")
+
+    monkeypatch.setattr(R, "lint", fake_lint)
+    monkeypatch.setattr(R, "compile_rtl",
+                        lambda *a, **k: R.StageResult("compile", True, [], ""))
+    monkeypatch.setattr(R, "simulate",
+                        lambda *a, **k: R.StageResult("simulate", True, [], ""))
+    monkeypatch.setattr(R, "synthesize",
+                        lambda *a, **k: R.StageResult("synth", True, [], ""))
+
+    client = Scripted()
+    run_problem(Problem(ROOT / "problems" / "counter"), client, tmp_path,
+                feedback_level="full", max_iterations=3, through="sta")
+
+    # The third prompt must ask to fix the restructuring, not revert it.
+    system = client.prompts[2][0]["content"]
+    user = client.prompts[2][1]["content"]
+    assert "WITHOUT reverting" in system, (
+        "a functional break after a timing repair must be corrected in place"
+    )
+    assert "Keep this structure" in user
+    # and it must be repairing the broken restructuring, not the slow design
+    assert "one bug" in user
+
+
+def test_rescue_happens_only_once(tmp_path, monkeypatch):
+    """If the corrected restructuring still fails, revert normally rather
+    than chasing a structure that will not come good."""
+    import rtlforge.loop as loop_mod
+    src = (ROOT / "rtlforge" / "loop.py").read_text()
+    assert "restructure_rescued = True" in src
+    assert "and not restructure_rescued" in src, (
+        "the rescue must be gated, or a bad structure can consume the whole "
+        "iteration budget"
+    )
