@@ -120,6 +120,41 @@ The loop plateaued: attempts 1, 3 and 5 landed on exactly -0.043ns, with
 attempts 2 and 4 failing at lint and compile in between and being rolled
 back. More iterations do not move it.
 
+### The transformation was not the problem -- the style was
+
+Measuring the model's carry-lookahead after correcting its bug, against three
+references at the same 1.2ns constraint:
+
+| Implementation | Style | WNS @ 1.2ns |
+|---|---|---|
+| Plain `a + b + cin` (ripple) | arithmetic | -0.021ns |
+| Model's carry-lookahead, bug fixed | explicit gate equations | -0.136ns |
+| Same 4-bit-group carry algorithm | arithmetic | -0.021ns |
+| Carry-select | arithmetic | +0.065ns |
+
+Two results, both against expectation.
+
+**Writing the carry logic as explicit AND/OR equations costs 115ps** versus
+expressing the identical algorithm arithmetically. Yosys's ABC restructures
+arithmetic freely but must take gate-level equations more literally, so a
+textbook-optimal structure written the textbook way blocks the optimisation
+that would have made it fast. The model's *choice* of carry-lookahead was
+sound; writing it at gate level is what lost.
+
+**Expressing the carry structure at RTL buys nothing at all when written
+arithmetically.** The 4-bit-group version and plain `a + b + cin` produce
+identical slack, to the picosecond -- ABC flattens both to the same
+implementation. Only carry-select improves on them, and it does so because it
+is a different dataflow (speculative computation plus a select), not a
+different way of writing the same carry chain.
+
+So the actionable finding for an agentic RTL tool is about *how* to write, not
+*what* to write: prompt for intent expressed arithmetically and leave
+structure to synthesis, except where the change is genuinely a different
+dataflow. An agent that reasons in textbook gate-level structures -- which is
+what an LLM reaches for when asked to speed up an adder -- will reliably make
+things worse.
+
 **The discarded attempts are the interesting part.** One of them is a
 complete 4-bit-group carry-lookahead adder -- propagate/generate per bit,
 group propagate/generate, group carry chain, per-bit carries. That is the
