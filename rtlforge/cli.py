@@ -117,7 +117,8 @@ def cmd_flow(args) -> int:
             sr = backend.techmap(design, work, problem.top, liberty)
         elif name == "sta":
             sr = backend.run_sta(work, problem.top, liberty,
-                                 args.clock_port, args.clock_period)
+                                 args.clock_port, args.clock_period,
+                                 io_delay_ns=args.io_delay)
         else:
             print(f"[TODO] {name}  not implemented yet")
             continue
@@ -178,6 +179,8 @@ def cmd_run(args) -> int:
         max_iterations=args.max_iterations,
         strict_lint=args.strict_lint,
         candidates=args.candidates,
+        through=args.through,
+        liberty=args.liberty,
     )
 
     out = _results_dir(Path(args.results_root))
@@ -185,9 +188,30 @@ def cmd_run(args) -> int:
         json.dumps(result.as_dict(), indent=2)
     )
     verdict = "PASS" if result.passed else "FAIL"
+
+    # A target no implementation can reach looks exactly like a model that
+    # cannot restructure. If every attempt missed by a wide margin and never
+    # improved, say so: the fix is the constraint, not the prompt.
+    if (not result.passed and result.final_wns_ns is not None
+            and result.final_wns_ns < 0):
+        slacks = [a.magnitude for a in result.attempts
+                  if a.failed_stage == "sta" and a.magnitude is not None]
+        if len(slacks) >= 3 and min(slacks) > 0.2:
+            print(
+                f"NOTE: every attempt missed timing by more than 20% of the "
+                f"clock period (best {result.final_wns_ns:+.3f}ns). Check the "
+                f"target is reachable before blaming the loop -- run "
+                f"`flow --through sta` on a hand-written design first."
+            )
+
+    extra = ""
+    if result.final_area_um2:
+        extra += f"  area={result.final_area_um2:.2f}um2"
+    if result.final_wns_ns is not None:
+        extra += f"  WNS={result.final_wns_ns:+.3f}ns"
     print(
         f"{verdict}  {problem.name}  level={args.level}  "
-        f"iters={result.iterations}  cells={result.final_cells}  "
+        f"iters={result.iterations}  cells={result.final_cells}{extra}  "
         f"tokens={result.prompt_tokens}+{result.completion_tokens}  "
         f"{result.wall_clock_s:.1f}s"
     )
@@ -215,6 +239,8 @@ def cmd_sweep(args) -> int:
                     max_iterations=args.max_iterations,
                     strict_lint=args.strict_lint,
                     candidates=args.candidates,
+                    through=args.through,
+                    liberty=args.liberty,
                 )
             except LLMError as e:
                 # A sweep that crashes on the last trial must not discard the
@@ -651,6 +677,12 @@ def main(argv=None) -> int:
         sp.add_argument("--candidates", type=int, default=1,
                         help="best-of-N sampling at higher temperature; the "
                              "tools pick the winner. Costs N generations.")
+        sp.add_argument("--through", default="synth",
+                        choices=["verify", "synth", "map", "sta"],
+                        help="how far to take each design; timing repair "
+                             "needs 'sta'")
+        sp.add_argument("--liberty", default=None,
+                        help="cell library (default: $RTLFORGE_LIBERTY)")
         sp.add_argument("--max-tokens", type=int, default=8192,
                         help="per-response ceiling; also reserved against "
                              "tokens-per-minute, so lower it if you see 429s")
@@ -676,6 +708,10 @@ def main(argv=None) -> int:
     sp.add_argument("--clock-period", type=float, default=2.0,
                     help="ns; the constraint timing is measured against and "
                          "which the agent may never change")
+    sp.add_argument("--io-delay", type=float, default=0.1,
+                    help="ns; absolute input/output delay. Absolute, not a "
+                         "fraction of the period, so slack moves 1:1 with "
+                         "the clock")
     sp.set_defaults(func=cmd_flow)
 
     sp = sub.add_parser("run", help="one problem, one feedback level")
@@ -726,6 +762,9 @@ def main(argv=None) -> int:
     sp.add_argument("--reasoning-effort", default=None,
                     choices=["low", "medium", "high"])
     sp.add_argument("--candidates", type=int, default=1)
+    sp.add_argument("--through", default="synth",
+                    choices=["verify", "synth", "map", "sta"])
+    sp.add_argument("--liberty", default=None)
     sp.add_argument("--max-tokens", type=int, default=8192)
     sp.set_defaults(func=cmd_benchmark)
 

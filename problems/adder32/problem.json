@@ -1,0 +1,8 @@
+{
+  "top": "adder32",
+  "testbench": "tb.v",
+  "category": "datapath",
+  "difficulty": "medium",
+  "clock_port": "clk",
+  "clock_period_ns": 1.2
+}

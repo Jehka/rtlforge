@@ -87,16 +87,31 @@ def test_fmax_needs_the_constraint_to_mean_anything():
     )
 
 
-def test_sdc_constrains_ports_not_just_the_clock():
-    import tempfile
-    with tempfile.TemporaryDirectory() as d:
-        p = Path(d) / "c.sdc"
-        write_sdc(p, "clk", 2.0)
-        text = p.read_text()
-        assert "create_clock" in text and "-period 2.0" in text
-        # Without I/O delays the tool gives port paths a full period and
-        # reports timing no real chip would meet.
-        assert "set_input_delay" in text and "set_output_delay" in text
+def test_sdc_constrains_ports_not_just_the_clock(tmp_path):
+    p = tmp_path / "c.sdc"
+    write_sdc(p, "clk", 2.0)
+    text = p.read_text()
+    assert "create_clock" in text and "-period 2.0" in text
+    # Without I/O delays the tool gives port paths a full period and
+    # reports timing no real chip would meet.
+    assert "set_input_delay" in text and "set_output_delay" in text
+
+
+def test_io_delay_does_not_move_with_the_clock(tmp_path):
+    """A fractional I/O delay makes slack move by less than the period does.
+
+    Observed on a 32-bit adder: tightening the clock 0.2ns moved WNS 0.16ns,
+    because the input budget shrank with it. Absolute delays keep a sweep
+    interpretable.
+    """
+    import re
+    delays = []
+    for period in (2.0, 1.0, 0.5):
+        p = tmp_path / f"c{period}.sdc"
+        write_sdc(p, "clk", period)
+        found = re.findall(r"set_input_delay\s+([\d.]+)", p.read_text())
+        delays.append(float(found[0]))
+    assert len(set(delays)) == 1, f"I/O delay moved with the clock: {delays}"
 
 
 def test_techmap_parses_area_and_flops():

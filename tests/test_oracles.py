@@ -45,6 +45,15 @@ CASES = [
     ("fifo", "fifo_overflow_bug.v", "simulate"),
     ("fifo", "fifo_comb_read_bug.v", "simulate"),
     ("fifo", "fifo_depth7_bug.v", "simulate"),
+    # ---- 32-bit adder. Two correct implementations with different critical
+    # paths, so the problem discriminates on timing rather than only on
+    # function -- which is the point of having it.
+    ("adder32", "adder32_ripple.v", None),
+    ("adder32", "adder32_fast.v", None),
+    ("adder32", "adder32_nocarry_bug.v", "simulate"),
+    # Model-generated carry-lookahead: right structure, one off-by-one.
+    ("adder32", "adder32_cla_offbyone_bug.v", "simulate"),
+    ("adder32", "adder32_cla_fixed.v", None),
 ]
 
 

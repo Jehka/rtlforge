@@ -104,6 +104,60 @@ the strictly harder `Prob073_dff16e` passed 6/6. Both classes are excluded from
 The loop optimises for passing verification, not for area. Any PPA claim would
 need a separate objective.
 
+## Timing repair: what the model actually attempts
+
+A second experiment ran the loop through static timing analysis on a 32-bit
+registered adder, constrained to a 1.2ns clock against Nangate45. Reference
+points on the same constraint:
+
+| Implementation | WNS @ 1.2ns | Area |
+|---|---|---|
+| Hand-written ripple carry | -0.021ns | 371.34 um^2 |
+| Hand-written carry-select | +0.065ns | 404.32 um^2 |
+| Model's best, after repair | -0.043ns | 370.80 um^2 |
+
+The loop plateaued: attempts 1, 3 and 5 landed on exactly -0.043ns, with
+attempts 2 and 4 failing at lint and compile in between and being rolled
+back. More iterations do not move it.
+
+**The discarded attempts are the interesting part.** One of them is a
+complete 4-bit-group carry-lookahead adder -- propagate/generate per bit,
+group propagate/generate, group carry chain, per-bit carries. That is the
+correct transformation for the problem. It fails on one line:
+
+```verilog
+wire [31:0] sum_comb = p ^ c;        // c[j] is the carry OUT of bit j
+wire [31:0] sum_comb = p ^ {c[30:0], cin};   // the sum needs the carry IN
+```
+
+With that single character-level correction it passes every test. Both
+versions are preserved as `examples/adder32_cla_offbyone_bug.v` and
+`examples/adder32_cla_fixed.v`, and both are in the oracle regression suite.
+
+So the failure is not "the model does not know how to speed up an adder". It
+selects the right structure and mis-implements one detail, then -- because the
+broken version fails simulation rather than timing -- gets rolled back to its
+slower but correct design and never revisits the idea. The loop's own
+correctness guarantee is what discards the better approach.
+
+That suggests a concrete direction: when a timing repair regresses to a
+*functional* failure, the useful feedback is the functional diagnostic on the
+new structure, not a revert to the old one. Current rollback treats "wrong"
+and "slow" as points on one scale, and here they are not.
+
+## A synthesis caveat worth stating
+
+The critical path of the hand-written ripple adder maps to
+`OR2 -> AOI21 -> OAI21 -> AOI21 -> OAI21 -> AOI21`. Yosys's ABC has already
+flattened the explicit ripple structure before timing runs. Hand-written
+carry-select beats it by only 86ps on a ~1.2ns path.
+
+Much of what RTL-level restructuring would buy is therefore already captured
+by synthesis, and the room an agent has to help at this level is narrower than
+textbook complexity arguments suggest. Any claim about agentic timing
+optimisation needs this baseline stated, or the gains attributed to the agent
+belong to ABC.
+
 ## What would strengthen this
 
 1. Run the full 152-problem set for an unbiased pass rate.

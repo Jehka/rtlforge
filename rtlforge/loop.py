@@ -15,13 +15,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
-from . import runners
+from . import backend, runners
 from .parsers import failure_magnitude, render_feedback
 from .providers import LLMClient, extract_verilog
 
@@ -66,6 +67,8 @@ class RunResult:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     final_cells: Optional[int] = None
+    final_area_um2: Optional[float] = None
+    final_wns_ns: Optional[float] = None
 
     def as_dict(self) -> dict:
         return {
@@ -79,6 +82,8 @@ class RunResult:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "final_cells": self.final_cells,
+            "final_area_um2": self.final_area_um2,
+            "final_wns_ns": self.final_wns_ns,
             "terminal_stage": self.terminal_stage,
             "truncated": self.truncated,
             "candidates_drawn": self.candidates_drawn,
@@ -148,6 +153,10 @@ class Problem:
             if not e.exists():
                 raise FileNotFoundError(f"missing source: {e}")
         self.sim_format = meta.get("sim_format", "markers")
+        # Timing constraint. Lives with the problem, not with the agent: the
+        # target is part of the specification, not something under repair.
+        self.clock_port = meta.get("clock_port", "clk")
+        self.clock_period_ns = float(meta.get("clock_period_ns", 2.0))
 
 
 def _generate_prompt(problem: Problem) -> List[dict]:
@@ -163,8 +172,17 @@ def _generate_prompt(problem: Problem) -> List[dict]:
     ]
 
 
+# How far through the pipeline an attempt got. Higher is better, and every
+# stage that can fail must appear: a stage missing from this table defaults to
+# 0 and therefore ranks below a lint failure, so rollback would discard a
+# design that was picoseconds from closing timing in favour of one that does
+# not parse. None means nothing failed.
 STAGE_RANK = {"generate": 0, "lint": 1, "compile": 2, "simulate": 3,
-              "synth": 4, None: 5}
+              "synth": 4, "map": 5, "sta": 6,
+              # Not implemented yet, ranked now so that adding them cannot
+              # silently reintroduce the bug this table exists to prevent.
+              "floorplan": 7, "place": 8, "cts": 9, "route": 10, "gds": 11,
+              None: 12}
 
 
 def _behaviour_key(stage_name: str, stage: dict) -> str:
@@ -185,6 +203,24 @@ def _behaviour_key(stage_name: str, stage: dict) -> str:
 
 
 def _magnitude_from(stage: dict) -> Optional[float]:
+    """How badly this stage failed, on a 0..1 scale where lower is better.
+
+    Simulation gives the fraction of mismatching samples. Timing gives the
+    violation as a fraction of the clock period -- without this, every timing
+    failure scored identically, so rollback could not tell an improving
+    attempt from a regressing one and reverted on ties. Timing is the one
+    stage with a genuinely continuous metric; discarding it defeats the point
+    of having it.
+    """
+    timing = stage.get("timing") or {}
+    wns = timing.get("wns")
+    period = timing.get("clock_period_ns")
+    if wns is not None and wns < 0 and period:
+        # 0.043ns short of a 1.2ns clock -> 0.036. Comparable to a sim
+        # mismatch fraction, and clamped so a hopeless design cannot outrank
+        # a functional failure.
+        return min(1.0, -wns / period)
+
     from .parsers import Diagnostic as _D
     diags = [_D(d["severity"], d["line"], d["code"], d["message"])
              for d in stage.get("diagnostics", [])]
@@ -223,6 +259,49 @@ def _history_block(attempts: List[Attempt], limit: int = 3) -> str:
         "change made things worse, reconsider the approach rather than "
         "adjusting it further.\n"
     )
+
+
+TIMING_SYSTEM_PROMPT = (
+    "You are an RTL design engineer closing timing. The design is already "
+    "functionally correct and must stay that way: do not change the module "
+    "name, port list, or observable behaviour. Reduce the delay on the "
+    "critical path by restructuring logic -- balancing a carry chain, "
+    "rebalancing a wide mux, precomputing a term, or adding a pipeline stage "
+    "only if the specification permits extra latency. Respond with exactly "
+    "one fenced code block containing the complete module and nothing else."
+)
+
+
+def _timing_repair_prompt(problem: Problem, rtl: str, feedback: str,
+                          history: str = "") -> List[dict]:
+    """Repair prompt for a timing violation.
+
+    Deliberately separate from the functional one. "Your design is wrong" and
+    "your design is too slow" are different tasks: the first invites changing
+    behaviour, which is exactly what must not happen here. Reusing the
+    functional prompt gets logic rewritten that was already correct.
+
+    The clock constraint is stated as fixed. The agent has no way to edit the
+    SDC -- it is written by the runner each time -- but saying so discourages
+    the model from proposing that as the fix.
+    """
+    return [
+        {"role": "system", "content": TIMING_SYSTEM_PROMPT},
+        {
+            "role": "user",
+            "content": (
+                f"Specification for module `{problem.top}`:\n\n{problem.spec}\n\n"
+                f"This implementation is functionally correct but fails "
+                f"timing at a fixed {problem.clock_period_ns}ns clock period. "
+                f"The clock constraint cannot be changed.\n\n"
+                f"```verilog\n{rtl}\n```\n\n"
+                f"Timing report:\n{feedback}\n"
+                f"{history}\n"
+                "Restructure the logic on the critical path to reduce its "
+                "delay. Keep the module name, ports and behaviour identical."
+            ),
+        },
+    ]
 
 
 def _repair_prompt(problem: Problem, rtl: str, stage: str,
@@ -290,6 +369,8 @@ def run_problem(
     max_iterations: int = 5,
     strict_lint: bool = False,
     candidates: int = 1,
+    through: str = "synth",
+    liberty: Optional[Path] = None,
 ) -> RunResult:
     if feedback_level not in STAGES_BY_LEVEL:
         raise ValueError(
@@ -298,6 +379,11 @@ def run_problem(
         )
 
     repair_stages = STAGES_BY_LEVEL[feedback_level]
+    scoring_stages = FLOW_TIERS.get(through, SCORING_STAGES)
+    # Backend stages are only repairable when the level reaches them.
+    if "synth" in repair_stages:
+        repair_stages = list(repair_stages) + ["map", "sta"]
+    liberty = Path(liberty or os.environ.get("RTLFORGE_LIBERTY", ""))
     workdir = runners.make_workdir(Path(workdir))
 
     # The trusted testbench is copied in fresh each run and never regenerated.
@@ -361,6 +447,13 @@ def run_problem(
         result.iterations = i
         design.write_text(rtl)
         rtl_hash = hashlib.sha256(rtl.encode()).hexdigest()[:12]
+
+        # Keep every attempt, not just the one that ran last. The failed ones
+        # are often the most informative: a timing run that plateaued showed
+        # the model reaching its best structure immediately, then repeatedly
+        # attempting something more ambitious and mis-writing it. That is only
+        # visible if the broken attempts survive.
+        (workdir / f"attempt_{i:02d}.v").write_text(rtl)
         attempt = Attempt(index=i, rtl=rtl, rtl_hash=rtl_hash)
 
         # An identical regeneration means the model has stopped responding to
@@ -404,8 +497,10 @@ def run_problem(
         failed_stage = None
         feedback = ""
 
-        # Score against every stage, always.
-        for stage in SCORING_STAGES:
+        # Score against every stage in the tier, always. The feedback level
+        # controls what the model is told; the tier controls how far the
+        # design is taken.
+        for stage in scoring_stages:
             if stage == "lint":
                 sr = runners.lint(design, workdir, strict=strict_lint)
             elif stage == "compile":
@@ -416,6 +511,12 @@ def run_problem(
                                       sim_format=problem.sim_format)
             elif stage == "synth":
                 sr = runners.synthesize(design, workdir, problem.top)
+            elif stage == "map":
+                sr = backend.techmap(design, workdir, problem.top, liberty)
+            elif stage == "sta":
+                sr = backend.run_sta(workdir, problem.top, liberty,
+                                     problem.clock_port,
+                                     problem.clock_period_ns)
             else:
                 continue
 
@@ -423,6 +524,22 @@ def run_problem(
 
             if sr.skipped:
                 continue
+
+            # Record measurements before the pass check: a violated WNS is
+            # still a measurement, and it is the one you most want in the log.
+            #
+            # Keep the BEST slack seen, not the last. The loop rolls back to
+            # its best attempt internally, so reporting the final attempt's
+            # number describes whichever restructuring the model happened to
+            # try last -- a run whose best attempt reached -0.322 reported
+            # -0.343 because attempt 5 was worse.
+            if getattr(sr, "map_metrics", None):
+                result.final_area_um2 = sr.map_metrics.area_um2
+            if getattr(sr, "timing", None) and sr.timing.wns is not None:
+                if (result.final_wns_ns is None
+                        or sr.timing.wns > result.final_wns_ns):
+                    result.final_wns_ns = sr.timing.wns
+
             if not sr.passed:
                 failed_stage = stage
                 feedback = render_feedback(sr.diagnostics)
@@ -482,12 +599,14 @@ def run_problem(
         else:
             repair_from, rolled = best_rtl, True
 
-        rtl = _generate(
-            client,
-            _repair_prompt(problem, repair_from, failed_stage, feedback,
-                           _history_block(result.attempts)),
-            result,
+        history = _history_block(result.attempts)
+        prompt = (
+            _timing_repair_prompt(problem, repair_from, feedback, history)
+            if failed_stage == "sta"
+            else _repair_prompt(problem, repair_from, failed_stage, feedback,
+                                history)
         )
+        rtl = _generate(client, prompt, result)
         if rolled:
             # Mark the attempt this repair was based on, not the one it replaced.
             attempt.rolled_back = True

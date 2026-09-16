@@ -25,6 +25,7 @@ regression, SymbiYosys, VerilogEval integration, result plotting.
 |---|---|---|
 | `counter` | `counter_en` | async reset, enable hold, 4-bit wrap |
 | `seq_detect` | `seq_detect_1011` | overlapping detection, one-cycle pulse, reset mid-pattern, 400 random bits vs. reference |
+| `adder32` | `adder32` | 32-bit registered add: corner cases, long carry chains, 500 random vectors. **The timing problem** -- two correct implementations (`adder32_ripple.v`, `adder32_fast.v`) with different critical paths, so repair has somewhere to go |
 | `fifo` | `sync_fifo` | fill/drain ordering, overflow and underflow ignored, simultaneous r/w, pointer wrap, 600 random ops vs. reference |
 
 Each has a known-good design and two to three known-bad ones in `examples/`.
@@ -260,6 +261,31 @@ not repair. The benchmark summary separates these: `repaired by` counts only
 runs with `iterations > 1`, and apparent rescues that passed first try are
 reported separately as noise. In the first 30-problem run this was the
 difference between a claimed +7 and a real +5.
+
+## Timing repair
+
+With `--through sta`, a timing violation feeds the critical path back and the
+agent restructures logic to close it.
+
+```bash
+python -m rtlforge.cli run --problem problems/counter --level full \
+    --through sta --liberty /path/to/cells.lib
+```
+
+Two things make this an optimisation loop rather than a second repair loop:
+
+- **A separate prompt.** "Your design is wrong" and "your design is too slow"
+  are different tasks. The functional prompt invites changing behaviour, which
+  is exactly what must not happen when the design is already correct. The
+  timing prompt states the module's behaviour and ports are fixed and asks
+  only for delay reduction on the reported path.
+- **The constraint is out of reach.** `run_sta` regenerates the SDC on every
+  call, so the clock period is a property of the problem, not something the
+  agent can relax. A design that meets timing because the clock slowed has not
+  improved. Set it in `problem.json` via `clock_period_ns`.
+
+Violated timing is recorded even on a failing run -- `final_wns_ns` is the
+measurement you most want when the loop does not converge.
 
 ## Design notes
 

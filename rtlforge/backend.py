@@ -287,14 +287,23 @@ def parse_sta(output: str, clock_period_ns: Optional[float] = None
 
 
 def write_sdc(path: Path, clock_port: str, period_ns: float,
-              input_delay_frac: float = 0.2) -> None:
+              io_delay_ns: float = 0.1) -> None:
     """Write a minimal but honest SDC.
 
-    Input/output delays matter: without them the tool sees combinational
-    paths from ports as having a full clock period available, and reports
-    timing that no real chip would meet.
+    I/O delays matter: without them the tool sees paths from ports as having
+    a full clock period available and reports timing no real chip would meet.
+
+    They are an ABSOLUTE value, not a fraction of the period. A fraction makes
+    the constraint move with the clock: tightening the period also tightens
+    the input budget, so slack changes by less than the period does and a
+    sweep produces numbers that are hard to reason about. Observed on a 32-bit
+    adder, where a 0.2ns tightening moved WNS by 0.16ns and the critical path
+    was an input path throughout.
+
+    With a fixed value, slack moves 1:1 with the period and a sweep means
+    what it looks like it means.
     """
-    io = period_ns * input_delay_frac
+    io = io_delay_ns
     path.write_text(
         f"create_clock -name clk -period {period_ns} [get_ports {clock_port}]\n"
         f"set_input_delay {io:.3f} -clock clk [all_inputs]\n"
@@ -304,7 +313,8 @@ def write_sdc(path: Path, clock_port: str, period_ns: float,
 
 
 def run_sta(workdir: Path, top: str, liberty: Path, clock_port: str,
-            period_ns: float, timeout: int = DEFAULT_TIMEOUT) -> StageResult:
+            period_ns: float, timeout: int = DEFAULT_TIMEOUT,
+            io_delay_ns: float = 0.1) -> StageResult:
     """Run OpenSTA on the mapped netlist against a fixed clock constraint."""
     if PD_BACKEND == "local":
         exe = shutil.which("sta") or shutil.which("opensta")
@@ -319,7 +329,7 @@ def run_sta(workdir: Path, top: str, liberty: Path, clock_port: str,
                            note="no mapped.v; run the map stage first")
 
     sdc = workdir / "constraints.sdc"
-    write_sdc(sdc, clock_port, period_ns)
+    write_sdc(sdc, clock_port, period_ns, io_delay_ns=io_delay_ns)
 
     script = workdir / "sta.tcl"
     script.write_text(
