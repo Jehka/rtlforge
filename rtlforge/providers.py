@@ -29,7 +29,10 @@ PROVIDERS = {
         "GEMINI_API_KEY",
     ),
     "ollama": (
-        "http://localhost:11434/v1",
+        # Overridable: on a shared machine the default port is often taken by
+        # another user's server, and hitting theirs returns "model not found"
+        # for models you have locally.
+        os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
         "qwen2.5-coder:7b",
         None,  # no key needed
     ),
