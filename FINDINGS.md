@@ -222,3 +222,25 @@ python -m rtlforge.cli benchmark --problems problems/verilogeval \
 
 Free-tier daily token caps mean this spans sessions; `--resume` continues from
 `raw.json`.
+
+## Model size and the ability to act on feedback
+
+Same 16-problem discriminating subset, 3 trials, both levels.
+
+| Model | none | full | gain | stalled (of 48) |
+|---|---|---|---|---|
+| qwen2.5-coder 7B (local, H100) | 6% | 19% | +13 | 38 |
+| qwen2.5-coder 32B (local, H100) | 23% | 42% | +19 | 20 |
+| gpt-oss 120B (Groq) | 31% | 66% | +35 | 3 |
+
+Pass rates rise with model size at both levels, as expected. The interesting
+column is the last one. A "stalled" run ended because the model regenerated
+byte-identical RTL after being shown its own tool diagnostic -- it is not
+converging slowly or oscillating, it is reproducing the same design.
+
+38 -> 20 -> 3 across the size range. The limiting factor for a small model in
+this loop is not RTL quality but whether it can act on a diagnostic at all.
+At 7B, roughly 80% of repair attempts are no-ops.
+
+This sharpens AutoChip's observation that tool feedback consistently helped
+only their strongest model: the mechanism is the stall rate.
