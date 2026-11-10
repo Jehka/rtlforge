@@ -95,9 +95,13 @@ def parse_report(path: str) -> tuple[str, list[dict]]:
         if not atts:
             continue
         last_status, last_body = atts[-2], atts[-1]
+        attempts = [{"n": int(atts[i]), "status": atts[i + 1],
+                     "rtl": _fenced_after("**rtl**", atts[i + 2]) or ""}
+                    for i in range(0, len(atts) - 2, 3)]
         runs.append({"name": name, "trial": trial[name],
                      "passed": last_status == "pass",
-                     "rtl": _fenced_after("**rtl**", last_body) or ""})
+                     "rtl": _fenced_after("**rtl**", last_body) or "",
+                     "attempts": attempts})
     return arm, runs
 
 

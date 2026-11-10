@@ -104,11 +104,23 @@ def _formal(args):
     return distinguish(ref, rtl, top_gold="RefModule", depth=depth)
 
 
-def collect(reports, per_problem, depth, jobs, seed):
+def collect(reports, per_problem, depth, jobs, seed, attempts=False, skip_noreset_init=False):
+    """Questions from failed designs.
+
+    attempts=False: the final design of each failed run (the original M1a).
+    attempts=True: every attempt that compiled but failed simulation,
+    including ones later repaired -- a strong generator rarely ends a run
+    failed, but its intermediate designs still hold its own mistakes.
+    """
     runs = []
     for p in reports:
         arm, rs = parse_report(p)
-        runs += [dict(r, arm=arm) for r in rs if not r["passed"] and r["rtl"].strip()]
+        if attempts:
+            runs += [dict(r, arm=arm, rtl=a["rtl"], attempt=a["n"]) for r in rs
+                     for a in r.get("attempts", [])
+                     if a["status"] == "fail at simulate" and a["rtl"].strip()]
+        else:
+            runs += [dict(r, arm=arm) for r in rs if not r["passed"] and r["rtl"].strip()]
     refs, specs = {}, {}
     for name in {r["name"] for r in runs}:
         rp = os.path.join(PROBLEMS, name, "ref.sv")
@@ -134,17 +146,23 @@ def collect(reports, per_problem, depth, jobs, seed):
     with ProcessPoolExecutor(max_workers=jobs) as pool:
         ds = list(pool.map(_formal, [(refs[k[0]], unique[k]["rtl"], depth) for k in keys],
                            chunksize=2))
-    items = []
+    items, skipped_noreset = [], 0
     for k, d in zip(keys, ds):
         if d.verdict not in ("logic", "init-only"):
+            continue
+        if skip_noreset_init and d.verdict == "init-only" and not d.resets:
+            # power-up value of a design with no reset: the spec cannot decide
+            skipped_noreset += 1
             continue
         q, gold = render_ab_question(d, gold_is_a=rng.random() < 0.5)
         fd = d.counterexample.first_difference()
         items.append({"problem": k[0], "arm": unique[k]["arm"],
+                      "attempt": unique[k].get("attempt"),
                       "verdict": d.verdict, "question": q, "gold": gold,
                       "cycles": fd.t if fd else None, "spec": specs[k[0]]})
     skipped = {"no spec": sum(1 for n in {r["name"] for r in runs} if not specs.get(n)),
-               "formal not a difference": len(keys) - len(items)}
+               "formal not a difference": len(keys) - len(items) - skipped_noreset,
+               "no-reset power-up (skipped)": skipped_noreset}
     return items, skipped
 
 
@@ -162,6 +180,10 @@ def main() -> int:
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--attempts", action="store_true",
+                    help="questions from every attempt that failed simulation, not just final designs")
+    ap.add_argument("--skip-noreset-init", action="store_true",
+                    help="drop init-only questions on designs with no reset (spec cannot decide)")
     args = ap.parse_args()
 
     if args.provider == "ollama" and not server_up(os.environ.get("OLLAMA_BASE_URL")):
@@ -174,7 +196,8 @@ def main() -> int:
                        reasoning_effort=args.reasoning_effort)
 
     items, skipped = collect(args.reports, args.per_problem, args.depth,
-                             args.jobs, args.seed)
+                             args.jobs, args.seed, attempts=args.attempts,
+                             skip_noreset_init=args.skip_noreset_init)
     if args.limit:
         items = items[:args.limit]
     print(f"{len(items)} questions ({skipped})", flush=True)
@@ -227,6 +250,9 @@ def main() -> int:
            + (f" (reasoning effort {args.reasoning_effort})" if args.reasoning_effort else "")
            + f", temperature 0, depth {args.depth}, "
            f"≤{args.per_problem} questions per problem, seed {args.seed}  ",
+           f"source designs: {'every attempt that failed simulation' if args.attempts else 'final designs of failed runs'}"
+           f"{'; no-reset power-up questions dropped' if args.skip_noreset_init else ''}  ",
+           f"reports: {', '.join(os.path.basename(r) for r in args.reports)}  ",
            f"skipped: {skipped}", "",
            "Every question comes from a design that **failed** its testbench, "
            "so design-level accuracy on these is 0%. Chance on A/B is 50%.", "",
