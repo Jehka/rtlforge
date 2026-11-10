@@ -1,0 +1,25 @@
+#!/bin/bash
+#PBS -N cvdp_selftest
+#PBS -l select=1:ncpus=16
+#PBS -l walltime=04:00:00
+#PBS -j oe
+# Harness self-test: every reference solution in the CVDP non-commercial
+# non-agentic set should pass under tools/cvdp_run.py. Failures here are
+# runner or environment bugs (or flaky CVDP tests), not model errors.
+# CPU only. Env: DATA (jsonl path), JOBS (default 12), MODE (skeleton|solutions).
+# The public HF dataset blanks the reference RTL, so MODE defaults to
+# skeleton: submit the provided skeleton unchanged. Every pass is a test
+# that cannot detect a do-nothing design.
+#
+#     cd ~/rtlforge && qsub tools/cvdp_selftest.pbs
+cd "$HOME/rtlforge" || exit 1
+export MAMBA_ROOT_PREFIX="$HOME/micromamba"
+eval "$("$HOME/bin/micromamba" shell hook -s bash)"
+micromamba activate cvdp || exit 1
+DATA="${DATA:-data/cvdp/cvdp_v1.1.0_nonagentic_code_generation_no_commercial.jsonl}"
+echo "dataset: $DATA"; iverilog -V | head -1
+mkdir -p results "$TMPDIR/cvdp_work" 2>/dev/null || mkdir -p results /tmp/$USER/cvdp_work
+WORK="${TMPDIR:-/tmp/$USER}/cvdp_work"; mkdir -p "$WORK"
+MODE="${MODE:-skeleton}"
+python tools/cvdp_run.py "$DATA" --$MODE --jobs "${JOBS:-12}" --timeout 900 \
+    --workdir "$WORK" --out "results/cvdp_${MODE}_$(date +%Y%m%d-%H%M).json"

@@ -1,0 +1,29 @@
+#!/bin/bash
+# Full VerilogEval benchmark, evidence on and off, as a batch job.
+# A multi-hour run cannot ride on an interactive SSH session: if the
+# connection drops, PBS ends the job. Submit from mgmt01:
+#
+#     cd ~/rtlforge && qsub tools/full_benchmark.pbs
+#     qstat -u $USER                       # is it running?
+#     tail -f ~/rtlforge/full_benchmark.log
+#
+# Reports land in ~/rtlforge/diag_*_evidence-{on,off}.md and are
+# rewritten after every run, so a job cut short still leaves results.
+#PBS -N rtlforge-full
+#PBS -q gpu
+#PBS -l select=1:ncpus=8:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -o full_benchmark.pbs.out
+
+cd "$HOME/rtlforge" || exit 1
+exec > >(tee -a "$HOME/rtlforge/full_benchmark.log") 2>&1
+echo "=== $(date) on $(hostname)"
+source tools/gpu_up.sh || { echo "gpu_up failed"; exit 1; }
+python tools/patch_cone_into_loop.py
+python tools/diagnose.py --preflight-only || { echo "preflight failed"; exit 1; }
+TRIALS="${TRIALS:-3}"
+python tools/diagnose.py --all --trials "$TRIALS"
+python tools/diagnose.py --all --trials "$TRIALS" --evidence off
+echo "=== done $(date)"
+kill "$OLLAMA_PID" 2>/dev/null   # only this job's server
