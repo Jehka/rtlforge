@@ -1,0 +1,42 @@
+#!/bin/bash
+# Full VerilogEval benchmark for any Ollama model, chosen at submit time.
+# Submit from mgmt01, e.g.:
+#
+#   qsub -v MODEL=qwen3.5:27b tools/model_benchmark.pbs
+#   qsub -v MODEL=gpt-oss:120b,NEED_MIB=70000,CTX=32768,MAXTOK=16384,ARMS=on tools/model_benchmark.pbs
+#
+# MODEL     Ollama tag (required)
+# ARMS      evidence arms to run, space-separated (default "on off")
+# TRIALS    trials per problem (default 3)
+# MAXTOK    max output tokens per call (default 3072; raise for reasoning models)
+# CTX       Ollama context window (default 8192; raise for reasoning models)
+# NEED_MIB  free GPU memory required to start (default 21000)
+# RUN_TIMEOUT  seconds per problem run, all iterations (default 1800)
+# REASONING low/medium/high for reasoning models (passed if the CLI supports it)
+#
+# A reasoning model can need far longer than 12 h for both arms: submit one
+# job per arm (ARMS=on, then ARMS=off) so each gets its own walltime.
+#PBS -N rtlforge-model
+#PBS -q gpu
+#PBS -l select=1:ncpus=8:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -o model_benchmark.pbs.out
+
+cd "$HOME/rtlforge" || exit 1
+: "${MODEL:?set MODEL, e.g. qsub -v MODEL=qwen3.5:27b tools/model_benchmark.pbs}"
+LOG="$HOME/rtlforge/model_benchmark_${MODEL//[:\/]/_}.log"
+exec > >(tee -a "$LOG") 2>&1
+echo "=== $(date) on $(hostname): $MODEL arms='${ARMS:-on off}'"
+export RTLFORGE_CTX="${CTX:-8192}" NEED_MIB="${NEED_MIB:-21000}"
+source tools/gpu_up.sh || { echo "gpu_up failed"; exit 1; }
+python tools/patch_cone_into_loop.py
+python tools/diagnose.py --preflight-only --model "$MODEL" || { echo "preflight failed"; exit 1; }
+for arm in ${ARMS:-on off}; do
+  python tools/diagnose.py --all --trials "${TRIALS:-3}" --model "$MODEL" \
+      --max-tokens "${MAXTOK:-3072}" --evidence "$arm" \
+      --timeout "${RUN_TIMEOUT:-1800}" \
+      ${REASONING:+--reasoning-effort "$REASONING"}
+done
+echo "=== done $(date)"
+kill "$OLLAMA_PID" 2>/dev/null   # only this job's server

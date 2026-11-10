@@ -1,0 +1,41 @@
+#!/bin/bash
+# M1a: spec-question answer accuracy, as a batch job. Submit from mgmt01:
+#
+#   qsub -v MODEL=qwen2.5-coder:32b tools/spec_query.pbs
+#   qsub -v MODEL=qwen3.8:27b,REASONING=low,MAXTOK=4096 tools/spec_query.pbs
+#   qsub -v MODEL=gpt-oss:120b,REASONING=low,MAXTOK=4096,NEED_MIB=70000,CTX=16384 tools/spec_query.pbs
+#
+# Uses the newest evidence-{on,off,cone,trace} reports in ~/rtlforge.
+#PBS -N rtlforge-m1a
+#PBS -q gpu
+#PBS -l select=1:ncpus=8:ngpus=1
+#PBS -l walltime=06:00:00
+#PBS -j oe
+#PBS -o spec_query.pbs.out
+
+cd "$HOME/rtlforge" || exit 1
+MODEL="${MODEL:-qwen2.5-coder:32b}"
+LOG="$HOME/rtlforge/spec_query_${MODEL//[:\/]/_}.log"
+exec > >(tee -a "$LOG") 2>&1
+echo "=== $(date) on $(hostname): $MODEL"
+export RTLFORGE_CTX="${CTX:-8192}" NEED_MIB="${NEED_MIB:-21000}"
+source tools/gpu_up.sh || { echo "gpu_up failed"; exit 1; }
+# Questions come from the designs of one generator model (SOURCE_MODEL), so
+# runs stay comparable. Newest-by-date alone picked up a partial qwen3.8
+# design benchmark on 2026-11-10 and dropped the off arm to 1 question.
+# Override with REPORTS="a.md b.md ..." to choose files by hand.
+SOURCE_MODEL="${SOURCE_MODEL:-qwen2.5-coder:32b}"
+if [ -z "${REPORTS:-}" ]; then
+  for arm in on off cone trace; do
+    f=$(ls -t diag_*_evidence-$arm.md 2>/dev/null | while read -r r; do
+          grep -q "^model \`$SOURCE_MODEL\`, level \`full\`" "$r" && { echo "$r"; break; }
+        done)
+    [ -n "$f" ] && REPORTS="$REPORTS $f" || echo "no full $SOURCE_MODEL report for arm $arm"
+  done
+fi
+echo "reports:$REPORTS"
+python tools/spec_query_eval.py $REPORTS --model "$MODEL" \
+    --max-tokens "${MAXTOK:-400}" --per-problem "${PER_PROBLEM:-5}" --jobs 8 \
+    ${REASONING:+--reasoning-effort "$REASONING"}
+echo "=== done $(date)"
+kill "$OLLAMA_PID" 2>/dev/null   # only this job's server

@@ -5,3 +5,14 @@ work/
 results/
 sim.out
 obj_dir/
+# cluster-only: datasets, job output, transfer bundles
+data/
+*.pbs.out
+cvdp_selftest.o*
+spec_query_*.log
+model_benchmark_*.log
+*.tgz
+*.zip
+*.bak.*
+sample_tree.json
+*.log

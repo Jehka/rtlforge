@@ -24,6 +24,8 @@ from typing import List, Optional
 
 from . import backend, runners
 from .parsers import failure_magnitude, render_feedback
+from .cone import cone_hint
+from .evidence import prioritise_diagnostics, repair_evidence
 from .providers import LLMClient, extract_verilog
 
 DESIGN_FILENAME = "design.v"
@@ -49,6 +51,9 @@ class Attempt:
     rolled_back: bool = False   # this attempt was repaired from an earlier one
     behaviour: str = ""         # fingerprint of the observed failure
     from_timing_repair: bool = False   # produced while restructuring for speed
+    cone: str = ""             # line-level evidence sent to the repair prompt
+    feedback: str = ""         # full diagnostics text sent to the repair prompt
+    resampled: bool = False    # redrawn after an identical regeneration
 
 
 @dataclass
@@ -91,6 +96,10 @@ class RunResult:
             "stop_reason": self.stop_reason,
             "attempts": [
                 {"index": a.index, "passed": a.passed, "stages": a.stages,
+                 "cone": a.cone,
+                 "feedback": a.feedback,
+                 "rtl": a.rtl,
+                 "resampled": a.resampled,
                  "rtl_hash": a.rtl_hash, "failed_stage": a.failed_stage,
                  "magnitude": a.magnitude, "rolled_back": a.rolled_back,
                  "behaviour": a.behaviour,
@@ -353,7 +362,9 @@ def _restructure_fix_prompt(problem: Problem, rtl: str, stage: str,
 
 
 def _repair_prompt(problem: Problem, rtl: str, stage: str,
-                   feedback: str, history: str = "") -> List[dict]:
+                   feedback: str, history: str = "",
+                   cone: str = "") -> List[dict]:
+    evidence = f"\nEvidence from simulation and the design:\n{cone}\n" if cone else ""
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {
@@ -363,6 +374,7 @@ def _repair_prompt(problem: Problem, rtl: str, stage: str,
                 f"This implementation failed at the {stage} stage:\n\n"
                 f"```verilog\n{rtl}\n```\n\n"
                 f"Tool diagnostics:\n{feedback}\n"
+                f"{evidence}"
                 f"{history}\n"
                 "Fix the underlying cause and return the complete corrected "
                 "module. Do not suppress warnings with pragmas and do not "
@@ -478,6 +490,7 @@ def run_problem(
     else:
         rtl = _generate(client, messages, result)
     seen_hashes: set = set()
+    resampled_identical = False   # one redraw per run
     # Behavioural fingerprints, not just textual ones. A model can rewrite
     # comments and signal names while producing functionally identical RTL --
     # the hash changes, the behaviour does not, and the loop pays for
@@ -511,6 +524,25 @@ def run_problem(
 
         # An identical regeneration means the model has stopped responding to
         # feedback. Further iterations cost tokens and change nothing.
+        _last_prompt = locals().get("prompt")
+        if (rtl_hash in seen_hashes and not resampled_identical
+                and i > 1 and _last_prompt):
+            resampled_identical = True
+            _retry = list(_last_prompt) + [
+                {"role": "assistant", "content": rtl},
+                {"role": "user", "content": 'That is exactly the code you returned before, and it failed as described. Return a corrected module whose behaviour differs from that code.'}]
+            _saved_temp = client.temperature
+            client.temperature = max(_saved_temp, 0.8)
+            try:
+                rtl = _generate(client, _retry, result)
+            finally:
+                client.temperature = _saved_temp
+            design.write_text(rtl)
+            (workdir / f"attempt_{i:02d}.v").write_text(rtl)
+            rtl_hash = hashlib.sha256(rtl.encode()).hexdigest()[:12]
+            attempt = Attempt(index=i, rtl=rtl, rtl_hash=rtl_hash,
+                              from_timing_repair=last_was_timing_repair)
+            attempt.resampled = True
         if rtl_hash in seen_hashes:
             attempt.failed_stage = "generate"
             attempt.stages.append({
@@ -595,7 +627,7 @@ def run_problem(
 
             if not sr.passed:
                 failed_stage = stage
-                feedback = render_feedback(sr.diagnostics)
+                feedback = render_feedback(prioritise_diagnostics(sr.diagnostics))
                 if sr.waveform:
                     feedback += (
                         "\n\nSignal trace around the first mismatch "
@@ -677,8 +709,16 @@ def run_problem(
                                              failed_stage, feedback, history)
             last_was_timing_repair = True   # still inside the restructuring
         else:
+            cone = ""
+            if failed_stage == "simulate":
+                cone = repair_evidence(
+                    repair_from, problem.top, feedback,
+                    previous=(getattr(result.attempts[-2], "feedback", "")
+                              if len(result.attempts) > 1 else ""))
+            attempt.cone = cone
+            attempt.feedback = feedback
             prompt = _repair_prompt(problem, repair_from, failed_stage,
-                                    feedback, history)
+                                    feedback, history, cone)
             last_was_timing_repair = False
         rtl = _generate(client, prompt, result)
         if rolled:
