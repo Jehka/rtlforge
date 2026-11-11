@@ -30,11 +30,23 @@ source tools/gpu_up.sh || { echo "gpu_up failed"; exit 1; }
 # Override with REPORTS="a.md b.md ..." to choose files by hand.
 SOURCE_MODEL="${SOURCE_MODEL:-qwen2.5-coder:32b}"
 if [ -z "${REPORTS:-}" ]; then
+  # Per arm: the report by SOURCE_MODEL with the MOST runs; ties go to the
+  # later timestamp in the file name. Not `ls -t`: a git checkout gives every
+  # report the same mtime, and on 2026-11-10 that picked smoke-test reports
+  # (0-80 runs) over the full 468-run ones.
   for arm in on off cone trace; do
-    f=$(ls -t diag_*_evidence-$arm.md 2>/dev/null | while read -r r; do
-          grep -q "^model \`$SOURCE_MODEL\`, level \`full\`" "$r" && { echo "$r"; break; }
-        done)
-    [ -n "$f" ] && REPORTS="$REPORTS $f" || echo "no full $SOURCE_MODEL report for arm $arm"
+    best="" bestn=-1
+    for r in $(ls diag_*_evidence-$arm.md 2>/dev/null | sort); do
+      grep -q "^model \`$SOURCE_MODEL\`, level \`full\`" "$r" || continue
+      n=$(grep -c '^### Prob' "$r")
+      [ "$n" -ge "$bestn" ] && { best="$r"; bestn="$n"; }
+    done
+    if [ -n "$best" ]; then
+      REPORTS="$REPORTS $best"; echo "arm $arm: $best ($bestn runs)"
+      [ "$bestn" -lt "${MIN_RUNS:-400}" ] && echo "WARNING: $best has only $bestn runs"
+    else
+      echo "no full $SOURCE_MODEL report for arm $arm"
+    fi
   done
 fi
 echo "reports:$REPORTS"

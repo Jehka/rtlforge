@@ -101,6 +101,20 @@ class LLMClient:
                 f"{key_env} is not set. Copy .env.example to .env and fill it in."
             )
 
+    @staticmethod
+    def read_timeout(max_tokens: int) -> float:
+        """Seconds to wait for one response.
+
+        A fixed 180 s cut off 16k-token answers mid-generation (2026-11-10:
+        the qwen3.8 16k run aborted at question 187). Scale with the budget,
+        assuming >= 20 tokens/s, never below 180 s; RTLFORGE_READ_TIMEOUT
+        overrides.
+        """
+        env = os.environ.get("RTLFORGE_READ_TIMEOUT")
+        if env:
+            return float(env)
+        return max(180.0, max_tokens / 20.0)
+
     def chat(self, messages: List[dict],
              max_tokens: Optional[int] = None) -> str:
         max_tokens = max_tokens or self.max_tokens
@@ -127,7 +141,7 @@ class LLMClient:
                     f"{self.base_url}/chat/completions",
                     headers=headers,
                     json=payload,
-                    timeout=180,
+                    timeout=self.read_timeout(max_tokens),
                 )
             except requests.RequestException as e:
                 last_err = str(e)
