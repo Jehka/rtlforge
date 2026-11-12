@@ -1,0 +1,28 @@
+#!/bin/bash
+# CVDP generation with a local model (upstream CVDP prompt and parsing).
+#
+#   qsub -v MODEL=qwen3.8:27b,REASONING=low,SAMPLES=3,CATS=cid003,OUTDIR=cvdp_gen/qwen38 tools/cvdp_gen.pbs
+#
+# CATS takes several categories joined by ":" (cid002:cid004). START_DELAY (seconds)
+# waits before choosing a GPU, so a job started alongside another does not pick the
+# same card before the first one has loaded its model.
+#PBS -N rtlforge-cvdpgen
+#PBS -q gpu
+#PBS -l select=1:ncpus=8:ngpus=1
+#PBS -l walltime=12:00:00
+#PBS -j oe
+#PBS -o cvdp_gen.pbs.out
+
+cd "$HOME/rtlforge" || exit 1
+MODEL="${MODEL:?set MODEL}"
+LOG="$HOME/rtlforge/cvdp_gen_${MODEL//[:\/]/_}.log"
+exec > >(tee -a "$LOG") 2>&1
+echo "=== $(date) on $(hostname): $MODEL samples=${SAMPLES:-1} cats=${CATS:-all} -> ${OUTDIR:?set OUTDIR}"
+sleep "${START_DELAY:-0}"
+export RTLFORGE_CTX="${CTX:-32768}" NEED_MIB="${NEED_MIB:-30000}"
+source tools/gpu_up.sh || { echo "gpu_up failed"; exit 1; }
+python tools/cvdp_generate.py "${DATA:-data/cvdp/cvdp_v1.1.0_nonagentic_code_generation_no_commercial.jsonl}" \
+    --model "$MODEL" ${REASONING:+--reasoning-effort "$REASONING"} --max-tokens "${MAXTOK:-16384}" \
+    --samples "${SAMPLES:-1}" ${CATS:+--category ${CATS//:/ }} --out-dir "$OUTDIR"
+echo "=== done $(date)"
+kill "$OLLAMA_PID" 2>/dev/null

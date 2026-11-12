@@ -1,0 +1,25 @@
+#!/bin/bash
+# Replay pipeline, judge stage: one model answers every question in QFILE.
+#
+#   qsub -v QFILE=replay/replay_q_qwen.jsonl,MODEL=qwen3.8:27b,REASONING=low tools/replay_judge.pbs
+#
+# Env: QFILE, MODEL, REASONING, MAXTOK (16384), CTX (24576), NEED_MIB, TAG.
+#PBS -N rtlforge-replay
+#PBS -q gpu
+#PBS -l select=1:ncpus=8:ngpus=1
+#PBS -l walltime=08:00:00
+#PBS -j oe
+#PBS -o replay_judge.pbs.out
+
+cd "$HOME/rtlforge" || exit 1
+MODEL="${MODEL:?set MODEL}"; QFILE="${QFILE:?set QFILE}"
+LOG="$HOME/rtlforge/replay_${MODEL//[:\/]/_}.log"
+exec > >(tee -a "$LOG") 2>&1
+echo "=== $(date) on $(hostname): judge $MODEL on $QFILE tag=${TAG:-}"
+export RTLFORGE_CTX="${CTX:-24576}" NEED_MIB="${NEED_MIB:-30000}"
+source tools/gpu_up.sh || { echo "gpu_up failed"; exit 1; }
+python tools/replay_pipeline.py judge "$QFILE" --model "$MODEL" \
+    --max-tokens "${MAXTOK:-16384}" ${REASONING:+--reasoning-effort "$REASONING"} \
+    --out "replay/replay_a_${MODEL//[:\/]/_}_${TAG:-x}_$(date +%Y%m%d-%H%M%S).jsonl"
+echo "=== done $(date)"
+kill "$OLLAMA_PID" 2>/dev/null

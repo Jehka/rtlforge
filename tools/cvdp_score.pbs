@@ -1,0 +1,24 @@
+#!/bin/bash
+# Score every cand_s*.jsonl in OUTDIR through the Docker-free CVDP harness (CPU).
+#
+#   qsub -v OUTDIR=cvdp_gen/qwen38 tools/cvdp_score.pbs
+#PBS -N rtlforge-cvdpscore
+#PBS -q workq
+#PBS -l select=1:ncpus=16
+#PBS -l walltime=06:00:00
+#PBS -j oe
+#PBS -o cvdp_score.pbs.out
+
+cd "$HOME/rtlforge" || exit 1
+export MAMBA_ROOT_PREFIX="$HOME/micromamba"
+eval "$("$HOME/bin/micromamba" shell hook -s bash)"
+micromamba activate cvdp || exit 1
+DATA="${DATA:-data/cvdp/cvdp_v1.1.0_nonagentic_code_generation_no_commercial.jsonl}"
+WORK="${TMPDIR:-/tmp/$USER}/cvdp_work"; mkdir -p "$WORK"
+for c in "${OUTDIR:?set OUTDIR}"/cand_s*.jsonl; do
+  ids=$(python -c "import json,sys; print(' '.join(json.loads(l)['id'] for l in open(sys.argv[1])))" "$c")
+  echo "=== $(date) scoring $c"
+  python tools/cvdp_run.py "$DATA" --candidates "$c" --ids $ids --jobs 12 --timeout 900 \
+      --workdir "$WORK" --out "${c%.jsonl}_result.json"
+done
+echo "=== done $(date)"
