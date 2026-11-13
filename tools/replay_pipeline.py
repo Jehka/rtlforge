@@ -327,6 +327,19 @@ def cmd_score(args):
             ws = [_winner(q, judges[n].get(q["qid"])) for n in ns]
             return ws[0] if ws[0] == ws[1] and ws[0] is not None else "split"
         strategies[f"two judges agree ({names[0]} + {names[1]})"] = agree
+    if len(names) >= 3:
+        def unanimous(q, ns=names):
+            ws = [_winner(q, judges[n].get(q["qid"])) for n in ns]
+            return ws[0] if ws[0] is not None and all(w == ws[0] for w in ws) else "split"
+        def majority_vote(q, ns=names):
+            ws = Counter(w for w in (_winner(q, judges[n].get(q["qid"])) for n in ns)
+                         if w is not None)
+            if not ws:
+                return "split"
+            (w, k), = ws.most_common(1)
+            return w if k * 2 > len(ns) else "split"
+        strategies[f"all {len(names)} judges agree"] = unanimous
+        strategies[f"majority of {len(names)} judges"] = majority_vote
 
     P = len(probs)
     def correct(p, cid):

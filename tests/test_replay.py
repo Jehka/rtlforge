@@ -61,3 +61,24 @@ def test_cvdp_prompt_matches_upstream_shape():
     assert s.startswith("You are a helpful assistance.\nConsider that you have a folder structure like the following:\n\n")
     assert "Specification to RTL Translation" in s and "JSON" not in s
     assert "JSON schemas" in cg.system_prompt(2, cg.SCHEMA)
+
+
+def test_three_judges_unanimous_and_majority(tmp_path):
+    import json
+    q = {"problem": "p", "spec": "s", "errors": 0,
+         "clusters": [{"id": 0, "weight": 2, "passed": True, "mixed": False},
+                      {"id": 1, "weight": 4, "passed": False, "mixed": False}],
+         "questions": [{"qid": "p:0-1", "ci": 0, "cj": 1, "label_i": "A"}]}
+    qf = tmp_path / "q.jsonl"; qf.write_text(json.dumps(q) + "\n")
+    files = []
+    for name, ans in (("j1", "A"), ("j2", "A"), ("j3", "B")):
+        f = tmp_path / f"{name}.jsonl"; f.write_text(json.dumps({"qid": "p:0-1", "model": name, "answer": ans}) + "\n")
+        files.append(str(f))
+    import argparse, io, contextlib
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        rp.cmd_score(argparse.Namespace(questions=str(qf), answers=files, out=None))
+    text = out.getvalue()
+    row = lambda key: next(l for l in text.splitlines() if l.startswith(f"| {key}"))
+    assert row("all 3 judges agree").split("|")[2].strip().startswith("0")   # 2-1 split -> defer
+    assert "1/1 (100.0%)" in row("majority of 3 judges")      # 2 of 3 pick the correct minority
