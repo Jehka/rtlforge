@@ -82,3 +82,36 @@ def test_three_judges_unanimous_and_majority(tmp_path):
     row = lambda key: next(l for l in text.splitlines() if l.startswith(f"| {key}"))
     assert row("all 3 judges agree").split("|")[2].strip().startswith("0")   # 2-1 split -> defer
     assert "1/1 (100.0%)" in row("majority of 3 judges")      # 2 of 3 pick the correct minority
+
+
+def test_inconclusive_pair_defers():
+    # clusters 0 and 1 have no question between them (no proof, no bounded difference)
+    p = _prob(3, [_q(0, 2), _q(1, 2)])
+    assert rp.decide(p, lambda q: q["ci"]) is None
+
+
+def test_judge_reuses_identical_questions(tmp_path, monkeypatch):
+    import json, types
+    q = {"problem": "p", "spec": "S", "clusters": [], "questions": [
+        {"qid": "p:0-1", "ci": 0, "cj": 1, "label_i": "A", "question": "Q1"},
+        {"qid": "p:0-2", "ci": 0, "cj": 2, "label_i": "A", "question": "Q2"}]}
+    old_q = tmp_path / "old_q.jsonl"
+    old_q.write_text(json.dumps({**q, "questions": [{**q["questions"][0], "qid": "p:5-6"}]}) + "\n")
+    old_a = tmp_path / "old_a.jsonl"
+    old_a.write_text(json.dumps({"qid": "p:5-6", "model": "m", "answer": "B", "answer_text": "B"}) + "\n")
+    new_q = tmp_path / "q.jsonl"; new_q.write_text(json.dumps(q) + "\n")
+    calls = []
+    import spec_query_eval, rtlforge.providers as pv
+    monkeypatch.setattr(spec_query_eval, "server_up", lambda u: True)
+    class Fake:
+        def __init__(self, **k): self.last_finish_reason = "stop"
+        def chat(self, m): calls.append(m); return "A"
+    monkeypatch.setattr(pv, "LLMClient", Fake)
+    out = tmp_path / "a.jsonl"
+    import argparse
+    rc = rp.cmd_judge(argparse.Namespace(questions=str(new_q), model="m", provider="ollama",
+                                         max_tokens=10, reasoning_effort=None, out=str(out),
+                                         reuse=[f"{old_q}::{old_a}"]))
+    rows = [json.loads(l) for l in open(out)]
+    assert rc == 0 and len(calls) == 1
+    assert rows[0]["answer"] == "B" and rows[0]["reused"] and rows[1]["answer"] == "A"

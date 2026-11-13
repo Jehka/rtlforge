@@ -76,10 +76,11 @@ def cluster_problem(args):
     """Insert designs one by one: join the first equivalent cluster, else
     become a new representative. Every pair of representatives is then
     compared exactly once, so all rep-pair counterexamples are on hand."""
-    from rtlforge.formal import distinguish, render_ab_question
+    from rtlforge.formal import distinguish, prove_equivalent, render_ab_question
     name, cands, depth, seed = args[:4]
     top = args[4] if len(args) > 4 else "TopModule"
     gate = args[5] if len(args) > 5 else False
+    prove = args[6] if len(args) > 6 else False
     cands = sorted(cands, key=lambda c: -len(c["runs"]))     # biggest first
     dropped = []
     if gate:
@@ -93,17 +94,25 @@ def cluster_problem(args):
                 shortest=False).verdict != "error"
             (usable if ok else dropped).append(c)
         cands = usable
-    reps, members, pairs, errors = [], [], {}, 0
+    reps, members, pairs, errors, inconclusive = [], [], {}, 0, []
+    pending = []                     # (rep index, new design) bounded-same, unproven
     for c in cands:
-        joined, ds = None, {}
+        joined, ds, unproven = None, {}, []
         for i, r in enumerate(reps):
             d = distinguish(r["rtl"], c["rtl"], top_gold=top,
                             top_gate=top, depth=depth)
             if d.verdict == "error":
                 errors += 1
             if _same(d):
-                joined = i
-                break
+                # Bounded "no difference in `depth` cycles" is not equivalence:
+                # with prove, merge only on an induction proof (NoTB merges on
+                # proven equivalence only).
+                if not prove or d.verdict == "init-only" or prove_equivalent(
+                        r["rtl"], c["rtl"], top_gold=top, top_gate=top) == "proven":
+                    joined = i
+                    break
+                unproven.append(i)
+                continue
             ds[i] = d
         if joined is not None:
             members[joined].append(c)
@@ -113,6 +122,7 @@ def cluster_problem(args):
         members.append([c])
         for i, d in ds.items():
             pairs[(i, j)] = d
+        inconclusive += [[i, j] for i in unproven]
     rng = random.Random(f"{seed}:{name}")
     clusters = []
     for i, ms in enumerate(members):
@@ -136,6 +146,7 @@ def cluster_problem(args):
     untestable = sum(1 for (i, j), d in pairs.items() if d.verdict == "error")
     return {"problem": name, "clusters": clusters, "questions": questions,
             "errors": errors, "untestable_pairs": untestable,
+            "inconclusive_pairs": inconclusive,
             "dropped": sum(len(c["runs"]) for c in dropped),
             "dropped_passed": sum(sum(c["passed"]) for c in dropped),
             "candidates": len(cands), "runs": sum(len(c["runs"]) for c in cands)}
@@ -145,7 +156,8 @@ def cmd_questions(args):
     cands = candidates(args.reports)
     if args.problems:
         cands = {p: c for p, c in cands.items() if p in set(args.problems)}
-    todo = [(p, cs, args.depth, args.seed) for p, cs in sorted(cands.items())]
+    todo = [(p, cs, args.depth, args.seed, "TopModule", False, args.prove)
+            for p, cs in sorted(cands.items())]
     specs = {}
     for p in cands:
         sp = os.path.join(PROBLEMS, p, "spec.md")
@@ -207,7 +219,7 @@ def cmd_questions_cvdp(args):
         if not top:
             print(f"no TOPLEVEL for {p}; skipped", file=sys.stderr)
             continue
-        todo.append((p, cs, args.depth, args.seed, top, True))
+        todo.append((p, cs, args.depth, args.seed, top, True, not args.no_prove))
         specs[p] = cvdp_spec(data[p])
     return _run_questions(args, todo, specs)
 
@@ -250,12 +262,33 @@ def cmd_judge(args):
                        max_tokens=args.max_tokens, reasoning_effort=args.reasoning_effort)
     probs = [json.loads(l) for l in open(args.questions)]
     items = [(p, q) for p in probs for q in p["questions"] if p["spec"]]
+    reuse = {}
+    for path in args.reuse or []:
+        old_q = {}
+        qpath = path.split("::")[0]
+        for line in open(qpath):
+            pp = json.loads(line)
+            for qq in pp["questions"]:
+                old_q[qq["qid"]] = (pp["spec"], qq["question"])
+        for line in open(path.split("::")[1]):
+            row = json.loads(line)
+            if row.get("model") == args.model and row["qid"] in old_q and row["answer"] in ("A", "B", "NEITHER"):
+                reuse[old_q[row["qid"]]] = row
     tag = args.model.replace(":", "_").replace("/", "_")
     path = args.out or os.path.join(ROOT, f"replay_a_{tag}_{dt.datetime.now():%Y%m%d-%H%M%S}.jsonl")
     print(f"{len(items)} questions -> {path}", flush=True)
     streak = 0
     with open(path, "w") as fh:
+        reused = 0
         for n, (p, q) in enumerate(items, 1):
+            old = reuse.get((p["spec"], q["question"]))
+            if old is not None:
+                # same spec and same question text, answered before by this model
+                text, ans = old["answer_text"], old["answer"]
+                reused += 1
+                fh.write(json.dumps({"qid": q["qid"], "model": args.model, "answer": ans,
+                                     "answer_text": text, "reused": True}) + "\n")
+                continue
             try:
                 text = client.chat(build_prompt(p["spec"], q["question"]))
             except Exception as exc:                          # noqa: BLE001
@@ -271,7 +304,7 @@ def cmd_judge(args):
                 return 3
             if n % 20 == 0:
                 print(f"  {n}/{len(items)}", flush=True)
-    print("answers:", path)
+    print(f"answers: {path} ({reused} reused)")
     return 0
 
 
@@ -401,7 +434,10 @@ def cmd_score(args):
               f"Formal errors: {sum(p['errors'] for p in probs)}.  ",
               f"Runs dropped at the compile gate: {sum(p.get('dropped', 0) for p in probs)} "
               f"(testbench-passing among them: {sum(p.get('dropped_passed', 0) for p in probs)}); "
-              f"problems with no usable candidate: {sum(not p['clusters'] for p in probs)}."]
+              f"problems with no usable candidate: {sum(not p['clusters'] for p in probs)}; "
+              f"pairs with no proof and no bounded difference (deferred): "
+              f"{sum(len(p.get('inconclusive_pairs', [])) for p in probs)} in "
+              f"{sum(bool(p.get('inconclusive_pairs')) for p in probs)} problems."]
     text = "\n".join(lines) + "\n"
     print(text)
     if args.out:
@@ -419,6 +455,8 @@ def main() -> int:
     q.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     q.add_argument("--seed", type=int, default=7)
     q.add_argument("--problems", nargs="*", help="only these problems (testing)")
+    q.add_argument("--prove", action="store_true",
+                   help="merge designs only on an induction proof (default off for VerilogEval reproducibility)")
     q.add_argument("--out")
     qc = sub.add_parser("questions-cvdp")
     qc.add_argument("dataset")
@@ -429,6 +467,8 @@ def main() -> int:
     qc.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     qc.add_argument("--seed", type=int, default=7)
     qc.add_argument("--problems", nargs="*")
+    qc.add_argument("--no-prove", action="store_true",
+                    help="merge on bounded equivalence alone (the 2026-11-13 first run)")
     qc.add_argument("--out")
     j = sub.add_parser("judge")
     j.add_argument("questions")
@@ -436,6 +476,8 @@ def main() -> int:
     j.add_argument("--provider", default="ollama")
     j.add_argument("--max-tokens", type=int, default=16384)
     j.add_argument("--reasoning-effort", default=None)
+    j.add_argument("--reuse", nargs="*",
+                   help="QFILE::ANSWERS pairs from earlier runs; identical questions are not re-asked")
     j.add_argument("--out")
     s = sub.add_parser("score")
     s.add_argument("questions")

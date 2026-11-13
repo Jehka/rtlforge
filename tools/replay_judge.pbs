@@ -4,6 +4,9 @@
 #   qsub -v QFILE=replay/replay_q_qwen.jsonl,MODEL=qwen3.8:27b,REASONING=low tools/replay_judge.pbs
 #
 # Env: QFILE, MODEL, REASONING, MAXTOK (16384), CTX (24576), NEED_MIB, TAG.
+# REUSE_Q + REUSE_TAG: reuse this model's answers from an earlier run on
+# REUSE_Q (newest replay/replay_a_<model>_<REUSE_TAG>_*.jsonl) for questions
+# whose spec and text are identical; only new questions are asked.
 #PBS -N rtlforge-replay
 #PBS -q gpu
 #PBS -l select=1:ncpus=8:ngpus=1
@@ -18,7 +21,12 @@ exec > >(tee -a "$LOG") 2>&1
 echo "=== $(date) on $(hostname): judge $MODEL on $QFILE tag=${TAG:-}"
 export RTLFORGE_CTX="${CTX:-24576}" NEED_MIB="${NEED_MIB:-30000}"
 source tools/gpu_up.sh || { echo "gpu_up failed"; exit 1; }
-python tools/replay_pipeline.py judge "$QFILE" --model "$MODEL" \
+REUSE=()
+if [ -n "${REUSE_Q:-}" ]; then
+  old=$(ls -t replay/replay_a_${MODEL//[:\/]/_}_${REUSE_TAG:?set REUSE_TAG}_*.jsonl 2>/dev/null | head -1)
+  [ -n "$old" ] && REUSE=(--reuse "$REUSE_Q::$old") && echo "reusing $old"
+fi
+python tools/replay_pipeline.py judge "$QFILE" --model "$MODEL" "${REUSE[@]}" \
     --max-tokens "${MAXTOK:-16384}" ${REASONING:+--reasoning-effort "$REASONING"} \
     --out "replay/replay_a_${MODEL//[:\/]/_}_${TAG:-x}_$(date +%Y%m%d-%H%M%S).jsonl"
 echo "=== done $(date)"

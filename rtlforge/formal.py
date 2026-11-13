@@ -311,6 +311,57 @@ def distinguish(rtl_gold: str, rtl_gate: str, top_gold: str = "TopModule",
         shutil.rmtree(work, ignore_errors=True)
 
 
+def prove_equivalent(rtl_gold: str, rtl_gate: str, top_gold: str = "TopModule",
+                     top_gate: str = "TopModule", max_steps: int = 24,
+                     timeout: int = 180, assume_reset: bool = True) -> str:
+    """Unbounded equivalence by temporal induction on the output miter.
+
+    distinguish() is a bounded check: "no difference in 20 cycles". CVDP
+    designs have deep state (a 24-hour clock first differs at the hour
+    rollover, tens of thousands of cycles in), so bounded "equivalent"
+    merged designs the testbench told apart (10 clusters on CVDP cid003,
+    2026-11-13). Clustering must use proven equivalence only, as NoTB does.
+
+    Returns "proven", "unproven" (induction did not close within max_steps,
+    or the base case found a difference), or "error".
+    """
+    resets = reset_inputs(rtl_gold) if assume_reset else {}
+    reset_args = " ".join(f"-set-at 1 in_{n} {v}" for n, v in resets.items())
+    # -prove-skip is not allowed with -tempinduct; -seq N leaves the first
+    # N-1 steps (here the reset cycle) unchecked instead.
+    seq = 2 if resets else 1
+    work = tempfile.mkdtemp(prefix="rtlforge-induct-")
+    try:
+        with open(os.path.join(work, "gold.v"), "w") as fh:
+            fh.write(rtl_gold)
+        with open(os.path.join(work, "gate.v"), "w") as fh:
+            fh.write(rtl_gate)
+        prep = "proc; memory -nomap; memory_map; flatten; async2sync; opt_clean"
+        script = (
+            f"read_verilog -sv gold.v; hierarchy -top {top_gold}; {prep}; "
+            f"rename {top_gold} gold; design -stash A; "
+            f"read_verilog -sv gate.v; hierarchy -top {top_gate}; {prep}; "
+            f"rename {top_gate} gate; design -stash B; "
+            f"design -copy-from A -as gold gold; design -copy-from B -as gate gate; "
+            f"miter -equiv -flatten -make_outputs -ignore_gold_x gold gate miter; "
+            f"hierarchy -top miter; "
+            f"sat -tempinduct -prove trigger 0 -seq {seq} -maxsteps {max_steps} "
+            f"-set-init-zero -enable_undef -set-def-inputs {reset_args} miter")
+        try:
+            p = subprocess.run([YOSYS, "-p", script], cwd=work, capture_output=True,
+                               text=True, timeout=timeout)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return "error"
+        out = p.stdout + p.stderr
+        if p.returncode != 0 or "ERROR" in out:
+            return "error"
+        if re.search(r"Induction step proven|SUCCESS!", out):
+            return "proven"
+        return "unproven"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 # -------------------------------------------------------------- render
 # Question wording, revised after the M1a audit (2026-11-10). The first
 # version opened every question with "a registered output reflects the
