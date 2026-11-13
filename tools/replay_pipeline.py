@@ -77,14 +77,28 @@ def cluster_problem(args):
     become a new representative. Every pair of representatives is then
     compared exactly once, so all rep-pair counterexamples are on hand."""
     from rtlforge.formal import distinguish, render_ab_question
-    name, cands, depth, seed = args
+    name, cands, depth, seed = args[:4]
+    top = args[4] if len(args) > 4 else "TopModule"
+    gate = args[5] if len(args) > 5 else False
     cands = sorted(cands, key=lambda c: -len(c["runs"]))     # biggest first
+    dropped = []
+    if gate:
+        # No-testbench compile gate: a design the formal front end cannot
+        # read on its own cannot be clustered or asked about. (Without this
+        # one unreadable design blocks every other cluster from sweeping.)
+        usable = []
+        for c in cands:
+            ok = bool(c["rtl"].strip()) and distinguish(
+                c["rtl"], c["rtl"], top_gold=top, top_gate=top, depth=1,
+                shortest=False).verdict != "error"
+            (usable if ok else dropped).append(c)
+        cands = usable
     reps, members, pairs, errors = [], [], {}, 0
     for c in cands:
         joined, ds = None, {}
         for i, r in enumerate(reps):
-            d = distinguish(r["rtl"], c["rtl"], top_gold="TopModule",
-                            top_gate="TopModule", depth=depth)
+            d = distinguish(r["rtl"], c["rtl"], top_gold=top,
+                            top_gate=top, depth=depth)
             if d.verdict == "error":
                 errors += 1
             if _same(d):
@@ -104,6 +118,8 @@ def cluster_problem(args):
     for i, ms in enumerate(members):
         labels = [p for m in ms for p in m["passed"]]
         clusters.append({"id": i, "weight": len(labels), "designs": len(ms),
+                         "n_passed": sum(labels),
+                         "sources": sorted({r[0] for m in ms for r in m["runs"]}),
                          "passed": sum(labels) * 2 > len(labels),
                          "mixed": 0 < sum(labels) < len(labels),
                          "hashes": [m["hash"] for m in ms]})
@@ -120,6 +136,8 @@ def cluster_problem(args):
     untestable = sum(1 for (i, j), d in pairs.items() if d.verdict == "error")
     return {"problem": name, "clusters": clusters, "questions": questions,
             "errors": errors, "untestable_pairs": untestable,
+            "dropped": sum(len(c["runs"]) for c in dropped),
+            "dropped_passed": sum(sum(c["passed"]) for c in dropped),
             "candidates": len(cands), "runs": sum(len(c["runs"]) for c in cands)}
 
 
@@ -128,13 +146,79 @@ def cmd_questions(args):
     if args.problems:
         cands = {p: c for p, c in cands.items() if p in set(args.problems)}
     todo = [(p, cs, args.depth, args.seed) for p, cs in sorted(cands.items())]
-    print(f"{len(todo)} problems, {sum(len(c) for c in cands.values())} unique designs, "
+    specs = {}
+    for p in cands:
+        sp = os.path.join(PROBLEMS, p, "spec.md")
+        specs[p] = open(sp).read() if os.path.exists(sp) else ""
+    return _run_questions(args, todo, specs)
+
+
+def cvdp_spec(dp: dict) -> str:
+    """What the generator was given: context files, then the request."""
+    parts = [f"File {f}:\n```\n{c}\n```" for f, c in (dp["input"].get("context") or {}).items()]
+    return "\n\n".join(parts + [dp["input"]["prompt"]])
+
+
+def cvdp_top(dp: dict) -> str:
+    h = dp.get("harness") or {}
+    env = (h.get("files", h) or {}).get("src/.env", "")
+    m = re.search(r"^\s*TOPLEVEL\s*=\s*(\S+)", env, re.M)
+    return m.group(1) if m else ""
+
+
+def cvdp_candidates(dataset, cand_dirs, categories):
+    """{id: [cand]} from cvdp_generate.py output dirs (cand_sN.jsonl with
+    cand_sN_result.json beside it); source = directory name."""
+    data = {}
+    for l in open(dataset):
+        if l.strip():
+            dp = json.loads(l)
+            if not categories or dp["categories"][0] in categories:
+                data[dp["id"]] = dp
+    out = defaultdict(dict)
+    for d in cand_dirs:
+        source = os.path.basename(os.path.normpath(d))
+        for f in sorted(os.listdir(d)):
+            m = re.fullmatch(r"cand_s(\d+)\.jsonl", f)
+            rf = os.path.join(d, f"cand_s{m.group(1)}_result.json") if m else ""
+            if not m or not os.path.exists(rf):
+                continue
+            verdict = {r["id"]: r["status"] == "pass" for r in json.load(open(rf))}
+            for l in open(os.path.join(d, f)):
+                row = json.loads(l)
+                if row["id"] not in data or row["id"] not in verdict:
+                    continue
+                rtl = "\n".join(t for n, t in sorted(row["files"].items())
+                                if n.endswith((".sv", ".v")) and t.strip())
+                h = hashlib.sha256(_norm(rtl).encode()).hexdigest()[:16]
+                c = out[row["id"]].setdefault(h, {"hash": h, "rtl": rtl, "runs": [], "passed": []})
+                c["runs"].append([source, int(m.group(1))])
+                c["passed"].append(verdict[row["id"]])
+    return data, {k: list(v.values()) for k, v in out.items()}
+
+
+def cmd_questions_cvdp(args):
+    data, cands = cvdp_candidates(args.dataset, args.candidates, set(args.category or []))
+    if args.problems:
+        cands = {p: c for p, c in cands.items() if p in set(args.problems)}
+    todo, specs = [], {}
+    for p, cs in sorted(cands.items()):
+        top = cvdp_top(data[p])
+        if not top:
+            print(f"no TOPLEVEL for {p}; skipped", file=sys.stderr)
+            continue
+        todo.append((p, cs, args.depth, args.seed, top, True))
+        specs[p] = cvdp_spec(data[p])
+    return _run_questions(args, todo, specs)
+
+
+def _run_questions(args, todo, specs):
+    print(f"{len(todo)} problems, {sum(len(t[1]) for t in todo)} unique designs, "
           f"{args.jobs} workers", flush=True)
     out = []
     with ProcessPoolExecutor(max_workers=args.jobs) as pool:
         for i, res in enumerate(pool.map(cluster_problem, todo), 1):
-            sp = os.path.join(PROBLEMS, res["problem"], "spec.md")
-            res["spec"] = open(sp).read() if os.path.exists(sp) else ""
+            res["spec"] = specs.get(res["problem"], "")
             out.append(res)
             if i % 20 == 0:
                 print(f"  {i}/{len(todo)}", flush=True)
@@ -147,6 +231,8 @@ def cmd_questions(args):
     print(f"clusters per problem: {dict(sorted(k.items()))}; "
           f"questions {sum(len(r['questions']) for r in out)}; "
           f"formal errors {sum(r['errors'] for r in out)}; "
+          f"runs dropped at the compile gate {sum(r.get('dropped', 0) for r in out)} "
+          f"(of which testbench-passing {sum(r.get('dropped_passed', 0) for r in out)}); "
           f"problems without a spec {sum(not r['spec'] for r in out)}")
     print("questions:", path)
     return 0
@@ -206,6 +292,8 @@ def decide(prob, outcome):
     cluster id, or None (defer). A cluster is accepted when it wins every
     question it takes part in; exactly one such cluster must exist."""
     cl = prob["clusters"]
+    if not cl:
+        return None
     if len(cl) == 1:
         return 0
     if not prob["questions"]:
@@ -242,10 +330,13 @@ def cmd_score(args):
 
     P = len(probs)
     def correct(p, cid):
-        return cid is not None and p["clusters"][cid]["passed"]
-    majority = lambda p: max(p["clusters"], key=lambda c: c["weight"])["id"]
-    first_try = sum(sum(c["passed"] * c["weight"] for c in p["clusters"]) /
-                    max(1, sum(c["weight"] for c in p["clusters"])) for p in probs)
+        return cid is not None and bool(p["clusters"]) and p["clusters"][cid]["passed"]
+    majority = lambda p: (max(p["clusters"], key=lambda c: c["weight"])["id"]
+                          if p["clusters"] else None)
+    first_try = sum((sum(c.get("n_passed", c["passed"] * c["weight"]) for c in p["clusters"])
+                     + p.get("dropped_passed", 0)) /
+                    max(1, sum(c["weight"] for c in p["clusters"]) + p.get("dropped", 0))
+                    for p in probs)
     single = [p for p in probs if len(p["clusters"]) == 1]
     lines = [f"# Replay of the no-testbench pipeline ({dt.datetime.now():%Y-%m-%d %H:%M})", "",
              f"Questions file `{os.path.basename(args.questions)}`; {P} problems; "
@@ -253,11 +344,12 @@ def cmd_score(args):
              "| problems by clusters | count | correct |", "|---|---|---|"]
     k = defaultdict(list)
     for p in probs:
-        k[min(len(p["clusters"]), 4)].append(p)
+        k[min(len(p["clusters"]), 4)].append(p)       # 0 = no usable candidate
     for n in sorted(k):
         lab = f"{n}" if n < 4 else "4+"
         lines.append(f"| {lab} | {len(k[n])} | "
-                     + (f"{sum(correct(p, 0) for p in k[n])} of the single cluster" if n == 1
+                     + ("no usable candidate" if n == 0 else
+                        f"{sum(correct(p, 0) for p in k[n])} of the single cluster" if n == 1
                         else f"a correct cluster exists in {sum(any(c['passed'] for c in p['clusters']) for p in k[n])}")
                      + " |")
     lines += ["", "| strategy | accepted | precision of accepted | deferred | accuracy (defer → majority) |",
@@ -265,6 +357,18 @@ def cmd_score(args):
               f"| first design (no pipeline) | — | — | — | {100 * first_try / P:.1f}% (expected) |",
               f"| largest formal cluster (majority vote, no judge) | {P} | {100 * sum(correct(p, majority(p)) for p in probs) / P:.1f}% | 0 | {100 * sum(correct(p, majority(p)) for p in probs) / P:.1f}% |",
               f"| oracle: a correct cluster exists | — | — | — | {100 * sum(any(c['passed'] for c in p['clusters']) for p in probs) / P:.1f}% (ceiling) |"]
+    if any(len(c.get("sources", [])) > 1 for p in probs for c in p["clusters"]):
+        # NoTB-style consensus: accept the largest cluster only when it spans
+        # every generator family present; no questions asked.
+        fam = max(len({s for c in p["clusters"] for s in c.get("sources", [])}) for p in probs)
+        cons = [(p, majority(p) if p["clusters"] and len(p["clusters"][majority(p)].get("sources", [])) >= fam
+                 else None) for p in probs]
+        acc_c = [(p, c) for p, c in cons if c is not None]
+        lines.append(f"| cross-family consensus (largest cluster spans all {fam} generators, no judge) | "
+                     f"{len(acc_c)} ({100 * len(acc_c) / P:.0f}%) | "
+                     f"{sum(correct(p, c) for p, c in acc_c)}/{len(acc_c)} "
+                     f"({100 * sum(correct(p, c) for p, c in acc_c) / max(1, len(acc_c)):.1f}%) | "
+                     f"{P - len(acc_c)} | {100 * sum(correct(p, majority(p)) for p in probs) / P:.1f}% |")
     for sname, fn in strategies.items():
         acc = [(p, decide(p, fn)) for p in probs]
         accepted = [(p, c) for p, c in acc if c is not None]
@@ -281,7 +385,10 @@ def cmd_score(args):
               f"agree and are wrong): {sum(not correct(p, 0) for p in single)}.  ",
               f"Clusters whose members disagree with the testbench verdict (formal says "
               f"equivalent, testbench says not): {mixed}.  ",
-              f"Formal errors: {sum(p['errors'] for p in probs)}."]
+              f"Formal errors: {sum(p['errors'] for p in probs)}.  ",
+              f"Runs dropped at the compile gate: {sum(p.get('dropped', 0) for p in probs)} "
+              f"(testbench-passing among them: {sum(p.get('dropped_passed', 0) for p in probs)}); "
+              f"problems with no usable candidate: {sum(not p['clusters'] for p in probs)}."]
     text = "\n".join(lines) + "\n"
     print(text)
     if args.out:
@@ -300,6 +407,16 @@ def main() -> int:
     q.add_argument("--seed", type=int, default=7)
     q.add_argument("--problems", nargs="*", help="only these problems (testing)")
     q.add_argument("--out")
+    qc = sub.add_parser("questions-cvdp")
+    qc.add_argument("dataset")
+    qc.add_argument("--candidates", nargs="+", required=True,
+                    help="cvdp_generate.py output dirs (with cand_sN_result.json)")
+    qc.add_argument("--category", nargs="*", default=["cid003"])
+    qc.add_argument("--depth", type=int, default=20)
+    qc.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
+    qc.add_argument("--seed", type=int, default=7)
+    qc.add_argument("--problems", nargs="*")
+    qc.add_argument("--out")
     j = sub.add_parser("judge")
     j.add_argument("questions")
     j.add_argument("--model", required=True)
@@ -312,7 +429,8 @@ def main() -> int:
     s.add_argument("--answers", nargs="*", default=[])
     s.add_argument("--out")
     args = ap.parse_args()
-    return {"questions": cmd_questions, "judge": cmd_judge, "score": cmd_score}[args.cmd](args)
+    return {"questions": cmd_questions, "questions-cvdp": cmd_questions_cvdp,
+            "judge": cmd_judge, "score": cmd_score}[args.cmd](args)
 
 
 if __name__ == "__main__":

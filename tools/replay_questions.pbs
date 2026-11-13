@@ -3,6 +3,10 @@
 # equivalence and write one spec question per pair of cluster representatives.
 #
 #   qsub -v REPORTS=a.md:b.md,OUT=replay/replay_q_qwen.jsonl tools/replay_questions.pbs
+#   qsub -v CVDP_DIRS=cvdp_gen/qwen38_cid003:cvdp_gen/gptoss_cid003,OUT=replay/replay_q_cvdp.jsonl tools/replay_questions.pbs
+#
+# REPORTS: VerilogEval diagnostic reports. CVDP_DIRS: cvdp_generate.py output
+# dirs that have been scored (cand_sN_result.json present); CATS (cid003).
 #PBS -N rtlforge-replayq
 #PBS -q workq
 #PBS -l select=1:ncpus=16
@@ -15,6 +19,12 @@ export MAMBA_ROOT_PREFIX="$HOME/micromamba"
 eval "$("$HOME/bin/micromamba" shell hook -s bash)"
 micromamba activate rtlforge || exit 1
 mkdir -p replay
-echo "=== $(date) on $(hostname): questions from $REPORTS -> $OUT"
-python tools/replay_pipeline.py questions ${REPORTS//:/ } --jobs 14 --out "${OUT:?set OUT}"
+echo "=== $(date) on $(hostname): questions from ${REPORTS:-$CVDP_DIRS} -> ${OUT:?set OUT}"
+if [ -n "${CVDP_DIRS:-}" ]; then
+  python tools/replay_pipeline.py questions-cvdp \
+      "${DATA:-data/cvdp/cvdp_v1.1.0_nonagentic_code_generation_no_commercial.jsonl}" \
+      --candidates ${CVDP_DIRS//:/ } --category ${CATS:-cid003} --jobs 14 --out "$OUT"
+else
+  python tools/replay_pipeline.py questions ${REPORTS//:/ } --jobs 14 --out "$OUT"
+fi
 echo "=== done $(date)"
