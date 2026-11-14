@@ -1,5 +1,9 @@
 # RTLForge — Findings
 
+> **These are the September 2026 experiments** (tool-feedback levels, model
+> size, timing repair). The current direction — trust without a golden
+> testbench — and its results are in **[docs/PROGRESS.md](docs/PROGRESS.md)**.
+
 First complete experiment. 16 problems × 2 feedback levels × 3 trials = 96 runs,
 `openai/gpt-oss-120b` via Groq, reasoning effort low, September 2026.
 

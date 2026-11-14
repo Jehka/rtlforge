@@ -1,23 +1,83 @@
 # RTLForge
 
-A generate → verify → repair loop for LLM-written RTL. The model proposes and
-repairs; Verilator, Icarus, and Yosys decide whether it is correct.
+Trust for LLM-written RTL **without a golden testbench**.
 
-The experiment this is built to run: **how much of the gap between a small
-local model and a large cloud one can be closed by giving the small model
-deterministic tool feedback?** Every feedback level is a separate run
-configuration so the ablation is one command.
+Every published generate → verify → repair loop for Verilog assumes someone
+already wrote a correct testbench. RTLForge asks what can be established
+without one: several candidate designs are compared by **formal equivalence
+checking**, each place they disagree becomes a concrete **spec question**
+("in cycle 3, with these inputs, must `empty` be 0 or 1?"), and **independent
+LLM judges from different model families** answer it from the spec. A design is
+accepted only when it wins every question. Open-source tools only: Yosys,
+Icarus, Verilator.
 
-**Backend architecture: [BACKEND.md](BACKEND.md)** — the spec-to-GDS plan, action-space rules, and cost analysis.
+**Progress report (start here): [docs/PROGRESS.md](docs/PROGRESS.md)** — the
+question, what was built, results with confidence intervals, honest status of
+each claim, next steps.
 
-**First complete experiment: [FINDINGS.md](FINDINGS.md)** — 96 runs, 31% → 66%
-on a discriminating subset, with the capability boundary and failure taxonomy.
+Earlier work: **[FINDINGS.md](FINDINGS.md)** (September 2026: feedback levels,
+model size, timing repair) · **[BACKEND.md](BACKEND.md)** (spec-to-GDS plan).
+
+## Headline results (14 Nov 2026)
+
+| result | number |
+|---|---|
+| formal disagreement vs golden testbench | recall 98.8%, agreement 99.5% (VerilogEval, 1,715 final designs) |
+| LLM judges on formal counterexample questions | 86–94% correct (qwen3.8, gemma4, gpt-oss medium) |
+| no-testbench pipeline, VerilogEval | first design 82.0% → **88.4–89.7%**; **~92%** of accepted designs correct |
+| same, CVDP spec-to-RTL (78 problems) | all three judges agree: **84.6%** correct at 33% coverage (95% CI 66–94) vs 81.0% for cross-family consensus — not yet significant, more problems running |
+| CVDP's own testbench | passes a sync-reset mutant of its reference LFSR 5/5 times |
 
 ## Status
 
-Working: parsers, runners, repair loop, CLI, three validated problems,
-oracle regression tests, container definitions. Not yet built: cocotb
-regression, SymbiYosys, VerilogEval integration, result plotting.
+| | |
+|---|---|
+| working | repair loop with structured evidence; formal distinguisher (shortest counterexample, reset/clock detection by usage); induction proofs; spec-question rendering; judge evaluation; full pipeline replay; Docker-free CVDP harness and generator; PBS jobs for the UPES H100 cluster; 185 unit tests |
+| running | CVDP code-completion problems (cid002) and a third generator family (Gemma 4) |
+| next | spec assumptions as formal constraints; repair from judge answers; paper draft |
+
+## The no-testbench pipeline
+
+| step | tool |
+|---|---|
+| generate N candidates (several model families) | `rtlforge/loop.py`, `tools/cvdp_generate.py` |
+| compile gate (Yosys front end + target simulator) | `tools/replay_pipeline.py` |
+| cluster by proven equivalence (induction) | `rtlforge/formal.py` `prove_equivalent()` |
+| shortest counterexample between cluster representatives | `rtlforge/formal.py` `distinguish()` |
+| counterexample → A/B spec question | `rtlforge/formal.py` `render_question()` |
+| judges answer (one job per model) | `tools/replay_pipeline.py judge`, `tools/replay_judge.pbs` |
+| accept a cluster that wins every question; defer otherwise | `tools/replay_pipeline.py score` |
+
+```bash
+# VerilogEval: questions from logged diagnostic reports (CPU), then judges (GPU), then score
+python tools/replay_pipeline.py questions diag_A.md diag_B.md --prove --out replay/q.jsonl
+python tools/replay_pipeline.py judge replay/q.jsonl --model qwen3.8:27b --reasoning-effort low
+python tools/replay_pipeline.py score replay/q.jsonl --answers replay/replay_a_*.jsonl
+
+# CVDP: candidates from scored cvdp_generate.py output
+python tools/replay_pipeline.py questions-cvdp DATA.jsonl --candidates cvdp_gen/modelA cvdp_gen/modelB --out replay/q_cvdp.jsonl
+```
+
+The golden testbench is never used by the pipeline, only to score it.
+
+## CVDP without Docker
+
+NVIDIA's CVDP harness runs each problem in Docker; the UPES cluster has no
+container runtime. `tools/cvdp_run.py` reproduces the container layout in a
+temporary directory (paths rewritten, each compose service's command run
+directly; pass = every service exits 0, as upstream). `tools/cvdp_generate.py`
+reproduces the upstream prompt and answer parsing verbatim, so pass rates are
+comparable with published numbers. Needs Icarus 13, cocotb 2.0.1, pytest 8.3.2
+(the `cvdp` micromamba environment). The public dataset blanks reference
+solutions; `--skeleton` runs the given skeletons as a do-nothing baseline.
+
+## Running on the UPES cluster
+
+Jobs are PBS scripts in `tools/`: GPU work on `-q gpu` (each job starts its own
+Ollama server on a free port and stops it by PID), CPU work on `workq`. The
+login node has internet; GPU nodes do not, so models are pulled on the login
+node with `tools/pull_models.sh` into the shared home. Code reaches the cluster
+by `git pull`.
 
 ## Problems
 
@@ -50,7 +110,10 @@ python -m rtlforge.cli run --problem problems/counter --level full
 python -m rtlforge.cli sweep --problem problems/counter --trials 5
 ```
 
-Requires `verilator`, `iverilog`, `yosys` on PATH, or use the containers.\n\n**New machine? Follow [SETUP.md](SETUP.md)** — WSL2, Docker, VS Code, and the\nlab-GPU migration, with a checkpoint after every step.
+Requires `verilator`, `iverilog`, `yosys` on PATH, or use the containers.
+
+**New machine? Follow [SETUP.md](SETUP.md)** — Docker, VS Code, and the
+lab-GPU migration, with a checkpoint after every step.
 
 ## Feedback levels
 
@@ -318,20 +381,23 @@ measurement you most want when the loop does not converge.
 
 ## Prior work
 
-This is a reimplementation of a well-covered idea, not a novel one. AutoChip
-(Blocklove et al., arXiv 2411.11856) is the closest reference and is open
-source. RTLFixer covers syntax repair, VerilogCoder the simulation loop,
-SpecLoop the formal loop. Read AutoChip before claiming anything here is new.
+The repair loop itself is a reimplementation of a well-covered idea: AutoChip
+(Blocklove et al., arXiv 2411.11856), RTLFixer (syntax repair), VerilogCoder
+(simulation loop), SpecLoop (formal loop). All assume a golden testbench or
+compiler oracle.
 
-The open question worth chasing: AutoChip found tool feedback consistently
-helped only their *strongest* model. Where that threshold sits for small
-open-weight coders is not well characterised, and it is what this harness is
-shaped to measure.
+The closest work to the no-testbench pipeline is **NoTB** (arXiv 2608.21962):
+cross-family equivalence clusters with Cadence JasperGold decide which specs to
+*accept*; the rest are deferred. RTLForge differs in resolving disagreements
+with spec questions answered by cross-family judges, in handling reset and
+(next) spec assumptions explicitly, and in using open-source tools only.
+Benchmarks: VerilogEval v2 (NVlabs), CVDP (NVlabs, Apache-2.0 harness).
 
 ## Next
 
-1. More problems — FSM, ALU, FIFO, then VerilogEval v2.
-2. Failure taxonomy: log why repair loops stall (oscillation between two wrong
-   fixes, error misattribution, iteration-count distributions).
-3. Feedback-representation ablation: raw log vs. structured, held constant.
-4. Ollama on local hardware, then the small-model-vs-feedback comparison.
+1. CVDP at larger n: code-completion problems (cid002) and a third generator
+   family; head-to-head with NoTB's rule on the same candidate pool.
+2. Spec assumptions (input stability, one-hot, valid ranges) as formal
+   constraints, so every question lies inside the spec's domain.
+3. Repair from judge answers, to get past the selection ceiling.
+4. Paper draft.
