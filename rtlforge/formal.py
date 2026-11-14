@@ -45,6 +45,40 @@ CLOCK_NAMES = {"clk", "clock", "clk_i", "i_clk"}
 
 _INPUT_DECL = re.compile(r"\binput\b([^;)]*)")
 _RESET_NAME = re.compile(r"^(a?reset|a?rst)(_?n|_b)?$|^(a?reset|a?rst)\w*$", re.I)
+# CVDP names resets i_rst_n, presetn, axi_aresetn, i_reset_bar, hreset_n,
+# w_rst, ... and clocks pclk, clk_in, axi_aclk, hclk, w_clk, clk1. The
+# VerilogEval-era rules above missed them, so no reset was applied and the
+# designs' power-up states were compared (2026-11-14 CVDP audit).
+_RESET_TOKEN = re.compile(r"^[ahpsm]?(rst|reset)(n|b)?$", re.I)
+_CLOCK_TOKEN = re.compile(r"^[a-z]?(clk|clock)\d*$", re.I)
+
+
+def _tokens(name: str) -> list[str]:
+    return [t for t in name.split("_") if t]
+
+
+def is_clock_name(name: str) -> bool:
+    return name in CLOCK_NAMES or any(_CLOCK_TOKEN.match(t) for t in _tokens(name))
+
+
+def _reset_like(code: str, name: str) -> bool:
+    if _RESET_NAME.match(name):
+        return True
+    toks = _tokens(name)
+    if not any(_RESET_TOKEN.match(t) for t in toks):
+        return False
+    if any(t.lower() in ("val", "value", "data", "count", "cnt") for t in toks):
+        return False                       # e.g. preset_value: a data input
+    # a reset is used: on an edge, or tested in a condition
+    n = re.escape(name)
+    return bool(re.search(rf"\b(?:pos|neg)edge\s+{n}\b", code)
+                or re.search(rf"\bif\s*\([^;]*\b{n}\b", code))
+
+
+def edge_inputs(rtl: str) -> set[str]:
+    """Inputs used as posedge/negedge in a sensitivity list."""
+    code = re.sub(r"//[^\n]*|/\*.*?\*/", "", rtl, flags=re.S)
+    return set(re.findall(r"\b(?:pos|neg)edge\s+(\w+)", code))
 
 
 def reset_inputs(rtl: str) -> dict[str, int]:
@@ -62,11 +96,13 @@ def reset_inputs(rtl: str) -> dict[str, int]:
         for name in re.findall(r"\b([A-Za-z_]\w*)\b", decl):
             if name in ("wire", "reg", "logic", "signed", "unsigned"):
                 continue
-            if _RESET_NAME.match(name):
+            if _reset_like(code, name):
                 level = _usage_level(code, name)
                 if level is None:
                     lname = name.lower()
-                    active_low = (lname.endswith(("_n", "_b"))
+                    last = _tokens(lname)[-1]
+                    active_low = (lname.endswith(("_n", "_b", "_bar", "_l"))
+                                  or re.fullmatch(r"[ahpsm]?(rst|reset)(n|b)", last) is not None
                                   or lname in ("resetn", "aresetn", "rstn", "arstn"))
                     level = 0 if active_low else 1
                 out[name] = level
@@ -132,6 +168,7 @@ class Distinction:
     logic: Check = field(default_factory=Check)
     init: Check = field(default_factory=Check)
     error: str = ""
+    clocks: set = field(default_factory=set)     # edge inputs that are not resets
 
     @property
     def counterexample(self) -> Check | None:
@@ -306,7 +343,8 @@ def distinguish(rtl_gold: str, rtl_gate: str, top_gold: str = "TopModule",
                         else:
                             init = chk
                         break
-        return Distinction(verdict, depth, resets, logic, init)
+        return Distinction(verdict, depth, resets, logic, init,
+                           clocks=edge_inputs(rtl_gold) - set(resets))
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -406,8 +444,9 @@ def _describe(d: Distinction, first: dict, second: dict) -> list[str]:
     last = trace[-1]
     outs = d.differing_outputs()
     all_inputs = sorted({k for s in trace for k in s.inputs})
-    clocked = any(k in CLOCK_NAMES for k in all_inputs)
-    inputs = [k for k in all_inputs if k not in CLOCK_NAMES]
+    isclk = lambda k: k in d.clocks or is_clock_name(k)
+    clocked = any(isclk(k) for k in all_inputs) or bool(d.clocks)
+    inputs = [k for k in all_inputs if not isclk(k)]
     row = lambda s: ", ".join(f"{k}={_fmt(s.inputs.get(k, '?'))}" for k in inputs) or "(no inputs)"
 
     lines = ["Two implementations of this specification behave differently."]

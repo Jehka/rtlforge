@@ -264,3 +264,31 @@ def test_line_comment_does_not_swallow_rest_of_file():
            "always_ff @(posedge clock or negedge reset) // async\n"
            "  if (!reset) q <= 0; else q <= d;\nendmodule\n")
     assert reset_inputs(rtl) == {"reset": 0}
+
+
+@pytest.mark.parametrize("rtl,want", [
+    ("module m(input i_clk, input i_rst_n, output reg q); always @(posedge i_clk or negedge i_rst_n) if(!i_rst_n) q<=0; else q<=1; endmodule", {"i_rst_n": 0}),
+    ("module m(input pclk, input presetn, output reg q); always @(posedge pclk) if(!presetn) q<=0; else q<=1; endmodule", {"presetn": 0}),
+    ("module m(input axi_aclk, input axi_aresetn, output reg q); always @(posedge axi_aclk) if(axi_aresetn==1'b0) q<=0; else q<=1; endmodule", {"axi_aresetn": 0}),
+    ("module m(input clk, input i_reset_bar, output reg q); always @(posedge clk) if(!i_reset_bar) q<=0; else q<=1; endmodule", {"i_reset_bar": 0}),
+    ("module m(input clk_in, input rst_in, output reg q); always @(posedge clk_in or posedge rst_in) if(rst_in) q<=0; else q<=1; endmodule", {"rst_in": 1}),
+    ("module m(input clk, input [7:0] preset_value, input load, output reg [7:0] q); always @(posedge clk) if(load) q<=preset_value; endmodule", {}),
+])
+def test_cvdp_reset_names(rtl, want):
+    """CVDP naming (2026-11-14 audit): missed resets meant power-up states were compared."""
+    assert reset_inputs(rtl) == want
+
+
+def test_cvdp_clock_names():
+    from rtlforge.formal import is_clock_name
+    assert all(is_clock_name(n) for n in ("pclk", "clk_in", "axi_aclk", "hclk", "w_clk", "clk1"))
+    assert not any(is_clock_name(n) for n in ("sel", "block", "clkdiv_en", "data"))
+
+
+def test_clock_named_clk_in_renders_as_sequential():
+    rtl_a = "module TopModule(input clk_in, input rst_in, input d, output reg q); always @(posedge clk_in) if (rst_in) q <= 0; else q <= d; endmodule"
+    rtl_b = "module TopModule(input clk_in, input rst_in, input d, output reg q); always @(posedge clk_in) if (rst_in) q <= 0; else q <= ~d; endmodule"
+    d = distinguish(rtl_a, rtl_b)
+    assert d.resets == {"rst_in": 1} and "clk_in" in d.clocks
+    q = render_question(d, "A", "B")
+    assert "Reset (rst_in=1) is asserted in cycle 1." in q and "clk_in=" not in q and "cycle 2" in q

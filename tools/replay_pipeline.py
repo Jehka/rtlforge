@@ -72,6 +72,30 @@ def _same(d) -> bool:
     return d.verdict == "equivalent" or (d.verdict == "init-only" and not d.resets)
 
 
+def compiles_in_simulator(rtl: str, top: str) -> bool | None:
+    """True/False if the target simulator elaborates the design; None if no
+    simulator is configured. Yosys accepts some designs Icarus rejects (an
+    output wire assigned in an always block); the harness then fails them
+    without running a test, so formally equivalent members of one cluster
+    got different testbench verdicts (6 clusters, CVDP, 2026-11-14). A compile
+    check needs no testbench. RTLFORGE_IVERILOG points at the harness's Icarus."""
+    exe = os.environ.get("RTLFORGE_IVERILOG")
+    if not exe:
+        return None
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "design.sv")
+        with open(src, "w") as fh:
+            fh.write(rtl)
+        try:
+            r = subprocess.run([exe, "-g2012", "-s", top, "-o", os.path.join(d, "a.vvp"), src],
+                               capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return r.returncode == 0
+
+
 def cluster_problem(args):
     """Insert designs one by one: join the first equivalent cluster, else
     become a new representative. Every pair of representatives is then
@@ -89,9 +113,10 @@ def cluster_problem(args):
         # one unreadable design blocks every other cluster from sweeping.)
         usable = []
         for c in cands:
-            ok = bool(c["rtl"].strip()) and distinguish(
-                c["rtl"], c["rtl"], top_gold=top, top_gate=top, depth=1,
-                shortest=False).verdict != "error"
+            ok = (bool(c["rtl"].strip())
+                  and compiles_in_simulator(c["rtl"], top) is not False
+                  and distinguish(c["rtl"], c["rtl"], top_gold=top, top_gate=top, depth=1,
+                                  shortest=False).verdict != "error")
             (usable if ok else dropped).append(c)
         cands = usable
     reps, members, pairs, errors, inconclusive = [], [], {}, 0, []
